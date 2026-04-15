@@ -1,0 +1,46 @@
+{
+  "name": "patter-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Patter Voice AI — give Claude the ability to make and receive phone calls",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --no-dts",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "cloudflared": "^0.7.1",
+    "express": "^5.2.1",
+    "getpatter": "^0.4.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "tsup": "^8.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "PatterAI",
+    "email": "hello@getpatter.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PatterAI/patter-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "voice",
+    "ai",
+    "phone",
+    "telephony",
+    "claude",
+    "patter"
+  ]
+}

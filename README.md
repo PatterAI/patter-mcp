@@ -74,13 +74,16 @@ Ask Claude:
 | `get_calls` | List all calls with status, duration, and cost |
 | `get_transcript` | Get the full conversation transcript of a call |
 
-### Voice Tools (used by the AI agent during calls)
+### Claude Code Integration (used by the AI agent during calls)
 
-| Tool | Description |
-|---|---|
-| `read_file` | Read a file from the filesystem |
-| `run_command` | Execute a shell command (30s timeout) |
-| `search_code` | Search for a pattern in code files |
+During a phone call, the voice agent has access to a full Claude Code session via the [Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview). This means the agent can:
+
+- Read, write, and edit files
+- Run shell commands and tests
+- Search codebases with Glob and Grep
+- Create git commits
+- Install dependencies
+- Anything Claude Code can do interactively
 
 ## How It Works
 
@@ -104,7 +107,9 @@ Ask Claude:
   <strong>MCP Server</strong><br>
   <em>Streamable HTTP :3000</em><br><br>
   <strong>Patter SDK</strong><br>
-  <em>Twilio + STT/TTS :8000</em>
+  <em>Twilio + STT/TTS :8000</em><br><br>
+  <strong>Claude Code</strong><br>
+  <em>Agent SDK (in-call)</em>
 </td>
 <td align="center">→</td>
 <td align="center">
@@ -122,10 +127,15 @@ Ask Claude:
 3. Phone rings, user answers
 4. AI agent: "Hi, I have a plan for the auth refactor..."
 5. User: "Show me the current auth.ts file"
-6. → read_file({ path: "src/auth.ts" })  [executes in <100ms]
+6. → claude_code({ task: "read src/auth.ts" })  [Claude Code Agent SDK]
 7. AI agent: "The file has 45 lines, it uses JWT tokens..."
-8. User: "Ok, proceed with the implementation"
-9. Call ends → transcript returned to Claude Code
+8. User: "Fix the token expiration bug"
+9. → claude_code({ task: "fix the token expiration bug in auth.ts" })
+10. AI agent: "Done. I updated line 23 to use a 24h expiration..."
+11. User: "Run the tests"
+12. → claude_code({ task: "run the tests" })
+13. AI agent: "All 42 tests passing."
+14. Call ends → transcript returned to Claude Code
 ```
 
 ### Example: Call a restaurant

@@ -5,6 +5,7 @@
 
 import { Patter } from "getpatter";
 import { allVoiceTools } from "./voice-tools.js";
+import { endCallSession } from "./claude-bridge.js";
 
 export interface CallRecord {
   callId: string;
@@ -124,6 +125,7 @@ export class PatterServer {
             record.metrics =
               (data.metrics as Record<string, unknown>) || {};
           }
+          endCallSession(callId);
           log(`Inbound call ${callId} ended`);
         },
       } as Record<string, unknown>)
@@ -183,6 +185,7 @@ export class PatterServer {
             record.metrics =
               (data.metrics as Record<string, unknown>) || {};
           }
+          endCallSession(callId);
           log(`Call ${callId} ended — ${record?.duration}s`);
         },
       } as Record<string, unknown>)

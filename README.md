@@ -6,6 +6,8 @@
   </picture>
 </p>
 
+<h1 align="center">Patter MCP</h1>
+
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/typescript-5.0%2B-3178c6?logo=typescript&logoColor=white" alt="TypeScript 5+" />

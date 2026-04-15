@@ -1,12 +1,10 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PatterAI/Patter/main/docs/patter-logo-banner.svg" alt="Patter" width="300" />
+  <img src="./docs/github-banner.png" alt="Patter MCP" width="100%" />
 </p>
 
-# Patter MCP Server
+An MCP server that gives your AI agent a phone number. Answer calls, dial out, edit code, call APIs, book meetings — all over voice.
 
-Give Claude the ability to make and receive real phone calls.
-
-An always-online MCP server that wraps the [Patter](https://github.com/PatterAI/Patter) Voice AI SDK. Claude Code connects via Streamable HTTP transport and gets access to voice calling tools. During calls, the AI agent can read files, run commands, and search code in real time.
+Built on the [Patter](https://github.com/PatterAI/Patter) Voice AI SDK. Claude Code connects via Streamable HTTP and gets access to voice calling tools. During calls, the AI agent can read files, run commands, and search code in real time.
 
 ## Tools
 

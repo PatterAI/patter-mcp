@@ -21,6 +21,10 @@ import {
   getCallsByUser,
   isDbAvailable,
 } from "./db.js";
+import {
+  MAX_CALL_DURATION_SECONDS,
+  decrementConcurrent,
+} from "./rate-limiter.js";
 
 export interface CallRecord {
   callId: string;
@@ -250,6 +254,16 @@ export class PatterServer {
 
     const agent = this.createAgent(systemPrompt, firstMessage, voice);
 
+    // Duration-enforcement timeout handle — cleared when the call ends normally.
+    let durationTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const clearDurationTimer = (): void => {
+      if (durationTimer !== undefined) {
+        clearTimeout(durationTimer);
+        durationTimer = undefined;
+      }
+    };
+
     this.phone
       .call({
         to,
@@ -267,8 +281,31 @@ export class PatterServer {
 
           this.persist(updated);
           log(`Call ${callId} connected`);
+
+          // Enforce maximum call duration.
+          durationTimer = setTimeout(() => {
+            log(
+              `WARNING: Call ${callId} exceeded maximum duration ` +
+                `(${MAX_CALL_DURATION_SECONDS}s) — force-terminating.`,
+            );
+            decrementConcurrent(userId);
+
+            const current = this.calls.get(callId);
+            if (current && current.status === "in-progress") {
+              const terminated = mergeRecord(current, {
+                status: "completed",
+                endedAt: Date.now(),
+                duration: MAX_CALL_DURATION_SECONDS,
+              });
+              this.persist(terminated);
+              endCallSession(callId);
+            }
+          }, MAX_CALL_DURATION_SECONDS * 1000);
         },
         onCallEnd: async (data: Record<string, unknown>) => {
+          clearDurationTimer();
+          decrementConcurrent(userId);
+
           const existing = this.calls.get(callId);
           if (!existing) return;
 
@@ -287,6 +324,9 @@ export class PatterServer {
         },
       } as Record<string, unknown>)
       .catch((err: Error) => {
+        clearDurationTimer();
+        decrementConcurrent(userId);
+
         const existing = this.calls.get(callId);
         if (!existing) return;
 

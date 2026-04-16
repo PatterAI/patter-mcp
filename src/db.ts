@@ -122,6 +122,9 @@ interface Statements {
   selectOne: Statement;
   selectByUser: Statement;
   selectAll: Statement;
+  countDailyByUser: Statement;
+  countConcurrentByUser: Statement;
+  sumHourlyCost: Statement;
 }
 
 let db: Database | undefined;
@@ -179,6 +182,33 @@ function prepareStatements(database: Database): Statements {
     selectAll: database.prepare(
       "SELECT * FROM calls ORDER BY started_at DESC",
     ),
+    /** Count outbound calls placed by a user today (UTC day boundary). */
+    countDailyByUser: database.prepare(`
+      SELECT COUNT(*) as count
+      FROM calls
+      WHERE user_id = ?
+        AND direction = 'outbound'
+        AND started_at >= ?
+    `),
+    /** Count active (ringing or in-progress) outbound calls for a user. */
+    countConcurrentByUser: database.prepare(`
+      SELECT COUNT(*) as count
+      FROM calls
+      WHERE user_id = ?
+        AND direction = 'outbound'
+        AND status IN ('ringing', 'in-progress')
+    `),
+    /**
+     * Sum the total field from the cost JSON within metrics for calls
+     * started within the current hour window.
+     */
+    sumHourlyCost: database.prepare(`
+      SELECT metrics
+      FROM calls
+      WHERE direction = 'outbound'
+        AND started_at >= ?
+        AND metrics IS NOT NULL
+    `),
   };
 }
 
@@ -249,4 +279,52 @@ export function getCallsByUser(userId?: string): CallRecord[] {
 export function getAllCalls(): CallRecord[] {
   if (!_dbAvailable || !stmts) return [];
   return (stmts.selectAll.all() as CallRow[]).map(rowToRecord);
+}
+
+/**
+ * Count outbound calls placed by `userId` since `sinceMs` (epoch ms).
+ * Returns 0 when the DB is unavailable.
+ */
+export function countDailyCallsByUser(userId: string, sinceMs: number): number {
+  if (!_dbAvailable || !stmts) return 0;
+  const row = stmts.countDailyByUser.get(userId, sinceMs) as
+    | { count: number }
+    | undefined;
+  return row?.count ?? 0;
+}
+
+/**
+ * Count active (ringing or in-progress) outbound calls for `userId`.
+ * Returns 0 when the DB is unavailable.
+ */
+export function countConcurrentCallsByUser(userId: string): number {
+  if (!_dbAvailable || !stmts) return 0;
+  const row = stmts.countConcurrentByUser.get(userId) as
+    | { count: number }
+    | undefined;
+  return row?.count ?? 0;
+}
+
+/**
+ * Sum estimated call costs for all outbound calls started since `sinceMs`.
+ * Reads the `cost.total` field from the JSON-serialised metrics column.
+ * Returns 0 when the DB is unavailable or no metrics are recorded.
+ */
+export function sumHourlyCostUsd(sinceMs: number): number {
+  if (!_dbAvailable || !stmts) return 0;
+
+  const rows = stmts.sumHourlyCost.all(sinceMs) as Array<{ metrics: string }>;
+  let total = 0;
+  for (const row of rows) {
+    try {
+      const metrics = JSON.parse(row.metrics) as Record<string, unknown>;
+      const cost = metrics.cost as Record<string, unknown> | undefined;
+      if (typeof cost?.total === "number") {
+        total += cost.total;
+      }
+    } catch {
+      // malformed metrics — skip
+    }
+  }
+  return total;
 }

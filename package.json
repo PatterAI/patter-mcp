@@ -14,6 +14,7 @@
     "better-sqlite3": "^12.9.0",
     "cloudflared": "^0.7.1",
     "getpatter": "^0.4.0",
+    "libphonenumber-js": "^1.12.41",
     "mcp-use": "^1.24.0",
     "zod": "^3.23.0"
   },

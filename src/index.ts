@@ -14,12 +14,22 @@ import { makeCallHandler, makeCallSchema, type MakeCallInput } from "./tools/mak
 import { callThirdPartyHandler, callThirdPartySchema, type CallThirdPartyInput } from "./tools/call-third-party.js";
 import { getCallsHandler } from "./tools/get-calls.js";
 import { getTranscriptHandler, getTranscriptSchema, type GetTranscriptInput } from "./tools/get-transcript.js";
+import { validatePhoneNumber } from "./phone-validation.js";
+import { checkRateLimit, recordCallStart } from "./rate-limiter.js";
 
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? "3000", 10);
 const PATTER_PORT = parseInt(process.env.PATTER_PORT ?? "8000", 10);
 
 function log(msg: string): void {
   process.stderr.write(`[patter-mcp] ${msg}\n`);
+}
+
+/** Build a uniform MCP error response from a plain message string. */
+function errorResponse(message: string) {
+  return {
+    content: [{ type: "text" as const, text: message }],
+    isError: true,
+  };
 }
 
 /**
@@ -79,7 +89,22 @@ server.tool(
   },
   async (args: MakeCallInput, ctx) => {
     const userId = extractUserId(ctx);
-    return makeCallHandler(args, patter, userId);
+
+    const phoneResult = validatePhoneNumber(args.to);
+    if (!phoneResult.valid) {
+      return errorResponse(phoneResult.error);
+    }
+
+    const rateResult = checkRateLimit(userId);
+    if (!rateResult.allowed) {
+      return errorResponse(rateResult.reason ?? "Rate limit exceeded.");
+    }
+
+    recordCallStart(userId);
+
+    // Replace raw input with the validated E.164 number
+    const validatedArgs: MakeCallInput = { ...args, to: phoneResult.e164 };
+    return makeCallHandler(validatedArgs, patter, userId);
   },
 );
 
@@ -95,7 +120,22 @@ server.tool(
   },
   async (args: CallThirdPartyInput, ctx) => {
     const userId = extractUserId(ctx);
-    return callThirdPartyHandler(args, patter, userId);
+
+    const phoneResult = validatePhoneNumber(args.to);
+    if (!phoneResult.valid) {
+      return errorResponse(phoneResult.error);
+    }
+
+    const rateResult = checkRateLimit(userId);
+    if (!rateResult.allowed) {
+      return errorResponse(rateResult.reason ?? "Rate limit exceeded.");
+    }
+
+    recordCallStart(userId);
+
+    // Replace raw input with the validated E.164 number
+    const validatedArgs: CallThirdPartyInput = { ...args, to: phoneResult.e164 };
+    return callThirdPartyHandler(validatedArgs, patter, userId);
   },
 );
 

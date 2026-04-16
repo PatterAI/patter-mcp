@@ -18,6 +18,7 @@ export type MakeCallInput = z.infer<typeof makeCallSchema>;
 export async function makeCallHandler(
   args: MakeCallInput,
   patter: PatterServer,
+  userId?: string,
 ) {
   try {
     const callId = await patter.makeCall(
@@ -27,6 +28,7 @@ export async function makeCallHandler(
       args.voice,
       args.machineDetection,
       args.voicemailMessage,
+      userId,
     );
 
     return {

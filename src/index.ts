@@ -7,7 +7,7 @@
  *   claude mcp add --transport http patter-mcp http://localhost:3000/mcp
  */
 
-import { MCPServer } from "mcp-use/server";
+import { MCPServer, oauthAuth0Provider } from "mcp-use/server";
 
 import { PatterServer } from "./patter-server.js";
 import { makeCallHandler, makeCallSchema, type MakeCallInput } from "./tools/make-call.js";
@@ -40,9 +40,21 @@ const patter: PatterServer = (() => {
 // MCP server with mcp-use
 // ---------------------------------------------------------------------------
 
+// OAuth is optional: when AUTH0_DOMAIN + AUTH0_AUDIENCE are set, all /mcp
+// endpoints require a valid Bearer token. When absent the server runs in
+// unauthenticated mode so local dev works without any auth configuration.
+const oauthConfig =
+  process.env.AUTH0_DOMAIN && process.env.AUTH0_AUDIENCE
+    ? oauthAuth0Provider({
+        domain: process.env.AUTH0_DOMAIN,
+        audience: process.env.AUTH0_AUDIENCE,
+      })
+    : undefined;
+
 const server = new MCPServer({
   name: "patter-mcp",
   version: "0.2.0",
+  ...(oauthConfig !== undefined ? { oauth: oauthConfig } : {}),
 });
 
 // -- make_call
@@ -55,7 +67,10 @@ server.tool(
       "code during the call. Returns immediately with a call ID.",
     schema: makeCallSchema,
   },
-  async (args: MakeCallInput) => makeCallHandler(args, patter),
+  async (args: MakeCallInput, ctx) => {
+    const userId = ctx.auth?.user.userId;
+    return makeCallHandler(args, patter, userId);
+  },
 );
 
 // -- call_third_party
@@ -68,7 +83,10 @@ server.tool(
       "complete and returns the full transcript.",
     schema: callThirdPartySchema,
   },
-  async (args: CallThirdPartyInput) => callThirdPartyHandler(args, patter),
+  async (args: CallThirdPartyInput, ctx) => {
+    const userId = ctx.auth?.user.userId;
+    return callThirdPartyHandler(args, patter, userId);
+  },
 );
 
 // -- get_calls
@@ -77,7 +95,10 @@ server.tool(
     name: "get_calls",
     description: "List all recent calls with their status, duration, cost, and turn count.",
   },
-  async () => getCallsHandler(patter),
+  async (_args, ctx) => {
+    const userId = ctx.auth?.user.userId;
+    return getCallsHandler(patter, userId);
+  },
 );
 
 // -- get_transcript
@@ -87,7 +108,10 @@ server.tool(
     description: "Get the full conversation transcript of a completed call.",
     schema: getTranscriptSchema,
   },
-  async (args: GetTranscriptInput) => getTranscriptHandler(args, patter),
+  async (args: GetTranscriptInput, ctx) => {
+    const userId = ctx.auth?.user.userId;
+    return getTranscriptHandler(args, patter, userId);
+  },
 );
 
 // ---------------------------------------------------------------------------
@@ -148,6 +172,7 @@ Patter MCP Server
   log(``);
   log(`Tools: make_call, call_third_party, get_calls, get_transcript`);
   log(`Voice tools (during calls): read_file, run_command, search_code`);
+  log(`Auth: ${oauthConfig ? `Auth0 (${process.env.AUTH0_DOMAIN})` : "disabled (no AUTH0_DOMAIN)"}`);
 }
 
 main().catch((err) => {

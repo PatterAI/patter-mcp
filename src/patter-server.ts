@@ -18,6 +18,8 @@ export interface CallRecord {
   duration?: number;
   transcript: Array<{ role: string; text: string }>;
   metrics?: Record<string, unknown>;
+  /** Owner of the call. Populated when auth is enabled. */
+  userId?: string;
 }
 
 function log(msg: string): void {
@@ -146,6 +148,7 @@ export class PatterServer {
     voice?: string,
     machineDetection?: boolean,
     voicemailMessage?: string,
+    userId?: string,
   ): Promise<string> {
     const callId = `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -156,6 +159,7 @@ export class PatterServer {
       status: "ringing",
       startedAt: Date.now(),
       transcript: [],
+      userId,
     });
 
     const agent = this.createAgent(systemPrompt, firstMessage, voice);
@@ -201,6 +205,32 @@ export class PatterServer {
     return callId;
   }
 
+  /**
+   * Return all calls, optionally filtered to those owned by `userId`.
+   * When `userId` is undefined every call is returned (unauthenticated mode).
+   */
+  getCallsForUser(userId?: string): ReadonlyMap<string, CallRecord> {
+    if (userId === undefined) return this.calls;
+    const filtered = new Map<string, CallRecord>();
+    for (const [id, record] of this.calls) {
+      if (record.userId === userId) {
+        filtered.set(id, record);
+      }
+    }
+    return filtered;
+  }
+
+  /**
+   * Return a single call record, enforcing ownership when `userId` is provided.
+   * Returns `undefined` if not found or if the call is owned by a different user.
+   */
+  getCallForUser(callId: string, userId?: string): CallRecord | undefined {
+    const record = this.calls.get(callId);
+    if (!record) return undefined;
+    if (userId !== undefined && record.userId !== userId) return undefined;
+    return record;
+  }
+
   /** Simulate a call completing (for testing without real Twilio). */
   simulateCallEnd(callId: string, transcript?: Array<{ role: string; text: string }>): void {
     const record = this.calls.get(callId);
@@ -225,13 +255,14 @@ export class PatterServer {
     to: string,
     task: string,
     voice?: string,
+    userId?: string,
   ): Promise<CallRecord> {
     const systemPrompt =
       `You are making a phone call on behalf of someone. Your task: ${task}\n\n` +
       `Be polite, concise, and focused on the task. When the task is complete ` +
       `or you have the information needed, thank them and end the call.`;
 
-    const callId = await this.makeCall(to, systemPrompt, undefined, voice);
+    const callId = await this.makeCall(to, systemPrompt, undefined, voice, undefined, undefined, userId);
     return this.waitForCallEnd(callId, 300_000);
   }
 

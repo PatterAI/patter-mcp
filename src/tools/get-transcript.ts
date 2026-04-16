@@ -13,8 +13,9 @@ export type GetTranscriptInput = z.infer<typeof getTranscriptSchema>;
 export async function getTranscriptHandler(
   args: GetTranscriptInput,
   patter: PatterServer,
+  userId?: string,
 ) {
-  const call = patter.calls.get(args.callId);
+  const call = patter.getCallForUser(args.callId, userId);
 
   if (!call) {
     return {

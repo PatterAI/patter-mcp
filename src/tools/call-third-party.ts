@@ -20,12 +20,14 @@ function formatTranscript(transcript: Array<{ role: string; text: string }>): st
 export async function callThirdPartyHandler(
   args: CallThirdPartyInput,
   patter: PatterServer,
+  userId?: string,
 ) {
   try {
     const record: CallRecord = await patter.callThirdParty(
       args.to,
       args.task,
       args.voice,
+      userId,
     );
 
     return {

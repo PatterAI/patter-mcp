@@ -8,17 +8,12 @@
  */
 
 import { MCPServer } from "mcp-use/server";
-import { z } from "zod";
-
-// mcp-use v1 types are declared against zod v4; we run zod v3.
-// The schemas are runtime-compatible — cast to satisfy the type checker.
-type ZodAny = z.ZodTypeAny;
 
 import { PatterServer } from "./patter-server.js";
-import { makeCallHandler } from "./tools/make-call.js";
-import { callThirdPartyHandler } from "./tools/call-third-party.js";
+import { makeCallHandler, makeCallSchema, type MakeCallInput } from "./tools/make-call.js";
+import { callThirdPartyHandler, callThirdPartySchema, type CallThirdPartyInput } from "./tools/call-third-party.js";
 import { getCallsHandler } from "./tools/get-calls.js";
-import { getTranscriptHandler } from "./tools/get-transcript.js";
+import { getTranscriptHandler, getTranscriptSchema, type GetTranscriptInput } from "./tools/get-transcript.js";
 
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? "3000", 10);
 const PATTER_PORT = parseInt(process.env.PATTER_PORT ?? "8000", 10);
@@ -31,14 +26,15 @@ function log(msg: string): void {
 // Shared Patter server instance
 // ---------------------------------------------------------------------------
 
-let patter: PatterServer;
-try {
-  patter = new PatterServer();
-} catch (err) {
-  log(`Failed to initialize Patter: ${err instanceof Error ? err.message : String(err)}`);
-  log("Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OPENAI_API_KEY");
-  process.exit(1);
-}
+const patter: PatterServer = (() => {
+  try {
+    return new PatterServer();
+  } catch (err) {
+    log(`Failed to initialize Patter: ${err instanceof Error ? err.message : String(err)}`);
+    log("Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OPENAI_API_KEY");
+    process.exit(1);
+  }
+})();
 
 // ---------------------------------------------------------------------------
 // MCP server with mcp-use
@@ -57,25 +53,9 @@ server.tool(
       "Place an outbound phone call with an AI voice agent. The agent speaks " +
       "using the system prompt and can read files, run commands, and search " +
       "code during the call. Returns immediately with a call ID.",
-    schema: z.object({
-      to: z.string().describe("Phone number to call in E.164 format (e.g. +15551234567)"),
-      systemPrompt: z.string().describe("Instructions for the AI voice agent on the call"),
-      firstMessage: z
-        .string()
-        .optional()
-        .describe("Opening message when the callee answers"),
-      voice: z.string().optional().describe("TTS voice name (e.g. alloy, nova, shimmer)"),
-      machineDetection: z
-        .boolean()
-        .optional()
-        .describe("Enable answering machine detection"),
-      voicemailMessage: z
-        .string()
-        .optional()
-        .describe("Message to leave on voicemail"),
-    }) as unknown as ZodAny,
+    schema: makeCallSchema,
   },
-  async (args) => makeCallHandler(args, patter),
+  async (args: MakeCallInput) => makeCallHandler(args, patter),
 );
 
 // -- call_third_party
@@ -86,17 +66,9 @@ server.tool(
       "Call a third party (restaurant, business, person) with a specific task. " +
       "An autonomous AI agent handles the conversation. Waits for the call to " +
       "complete and returns the full transcript.",
-    schema: z.object({
-      to: z.string().describe("Phone number to call in E.164 format"),
-      task: z
-        .string()
-        .describe(
-          "What the AI agent should accomplish on the call (e.g. 'ask if there is a table for 2 tonight at 8pm')",
-        ),
-      voice: z.string().optional().describe("TTS voice name"),
-    }) as unknown as ZodAny,
+    schema: callThirdPartySchema,
   },
-  async (args) => callThirdPartyHandler(args, patter),
+  async (args: CallThirdPartyInput) => callThirdPartyHandler(args, patter),
 );
 
 // -- get_calls
@@ -113,11 +85,9 @@ server.tool(
   {
     name: "get_transcript",
     description: "Get the full conversation transcript of a completed call.",
-    schema: z.object({
-      callId: z.string().describe("The call ID returned by make_call or shown in get_calls"),
-    }) as unknown as ZodAny,
+    schema: getTranscriptSchema,
   },
-  async (args) => getTranscriptHandler(args, patter),
+  async (args: GetTranscriptInput) => getTranscriptHandler(args, patter),
 );
 
 // ---------------------------------------------------------------------------

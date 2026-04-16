@@ -134,11 +134,13 @@ async function executeLocally(
     }
   } else {
     log(`Creating new local session in ${workDir}`);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await using session = unstable_v2_createSession({
       model: "sonnet",
       permissionMode: "acceptEdits",
+      cwd: workDir,
       allowedTools: ["Bash", "Read", "Write", "Edit", "Glob", "Grep"],
-    });
+    } as any);
 
     const sessionId = (session as unknown as { sessionId?: string }).sessionId;
     if (sessionId) {

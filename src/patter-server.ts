@@ -298,6 +298,7 @@ export class PatterServer {
                 duration: MAX_CALL_DURATION_SECONDS,
               });
               this.persist(terminated);
+              // Fire-and-forget: setTimeout cannot await; endCallSession has internal error handling
               void endCallSession(callId);
             }
           }, MAX_CALL_DURATION_SECONDS * 1000);

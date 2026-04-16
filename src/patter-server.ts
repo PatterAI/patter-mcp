@@ -209,7 +209,7 @@ export class PatterServer {
           });
 
           this.persist(updated);
-          endCallSession(callId);
+          await endCallSession(callId);
           log(`Inbound call ${callId} ended`);
         },
       } as Record<string, unknown>)
@@ -298,7 +298,7 @@ export class PatterServer {
                 duration: MAX_CALL_DURATION_SECONDS,
               });
               this.persist(terminated);
-              endCallSession(callId);
+              void endCallSession(callId);
             }
           }, MAX_CALL_DURATION_SECONDS * 1000);
         },
@@ -319,7 +319,7 @@ export class PatterServer {
           });
 
           this.persist(updated);
-          endCallSession(callId);
+          await endCallSession(callId);
           log(`Call ${callId} ended — ${updated.duration}s`);
         },
       } as Record<string, unknown>)

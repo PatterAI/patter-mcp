@@ -18,8 +18,8 @@ interface CallRow {
   user_id: string | null;
   to_number: string | null;
   from_number: string | null;
-  direction: string;
-  status: string;
+  direction: "outbound" | "inbound";
+  status: "ringing" | "in-progress" | "completed" | "failed";
   started_at: number;
   ended_at: number | null;
   duration: number | null;
@@ -51,8 +51,26 @@ CREATE INDEX IF NOT EXISTS idx_calls_status  ON calls(status);
 `.trim();
 
 // ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+function log(msg: string): void {
+  process.stderr.write(`[patter-db] ${msg}\n`);
+}
+
+// ---------------------------------------------------------------------------
 // Row <-> CallRecord conversion (immutable — always return new objects)
 // ---------------------------------------------------------------------------
+
+function safeParseJson<T>(raw: string | null, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    log("Corrupt JSON column, using fallback");
+    return fallback;
+  }
+}
 
 function rowToRecord(row: CallRow): CallRecord {
   return {
@@ -60,17 +78,19 @@ function rowToRecord(row: CallRow): CallRecord {
     userId: row.user_id ?? undefined,
     to: row.to_number ?? undefined,
     from: row.from_number ?? undefined,
-    direction: row.direction as CallRecord["direction"],
-    status: row.status as CallRecord["status"],
+    direction: row.direction,
+    status: row.status,
     startedAt: row.started_at,
     endedAt: row.ended_at ?? undefined,
     duration: row.duration ?? undefined,
-    transcript: row.transcript
-      ? (JSON.parse(row.transcript) as Array<{ role: string; text: string }>)
-      : [],
-    metrics: row.metrics
-      ? (JSON.parse(row.metrics) as Record<string, unknown>)
-      : undefined,
+    transcript: safeParseJson<Array<{ role: string; text: string }>>(
+      row.transcript,
+      [],
+    ),
+    metrics: safeParseJson<Record<string, unknown> | undefined>(
+      row.metrics,
+      undefined,
+    ),
   };
 }
 
@@ -108,7 +128,12 @@ let db: Database | undefined;
 let stmts: Statements | undefined;
 
 /** True when the SQLite database initialised successfully. */
-export let dbAvailable = false;
+let _dbAvailable = false;
+
+/** Returns true when the SQLite database initialised successfully. */
+export function isDbAvailable(): boolean {
+  return _dbAvailable;
+}
 
 // ---------------------------------------------------------------------------
 // Exported path so callers / tests can inspect where the DB lives
@@ -121,6 +146,42 @@ export const DB_PATH =
 // Public API
 // ---------------------------------------------------------------------------
 
+function prepareStatements(database: Database): Statements {
+  return {
+    upsert: database.prepare(`
+      INSERT INTO calls (
+        call_id, user_id, to_number, from_number,
+        direction, status, started_at, ended_at,
+        duration, transcript, metrics
+      ) VALUES (
+        @call_id, @user_id, @to_number, @from_number,
+        @direction, @status, @started_at, @ended_at,
+        @duration, @transcript, @metrics
+      )
+      ON CONFLICT(call_id) DO UPDATE SET
+        user_id      = excluded.user_id,
+        to_number    = excluded.to_number,
+        from_number  = excluded.from_number,
+        direction    = excluded.direction,
+        status       = excluded.status,
+        started_at   = excluded.started_at,
+        ended_at     = excluded.ended_at,
+        duration     = excluded.duration,
+        transcript   = excluded.transcript,
+        metrics      = excluded.metrics
+    `),
+    selectOne: database.prepare(
+      "SELECT * FROM calls WHERE call_id = ?",
+    ),
+    selectByUser: database.prepare(
+      "SELECT * FROM calls WHERE user_id = ? ORDER BY started_at DESC",
+    ),
+    selectAll: database.prepare(
+      "SELECT * FROM calls ORDER BY started_at DESC",
+    ),
+  };
+}
+
 /**
  * Initialise the SQLite connection and create tables.
  * Safe to call multiple times — subsequent calls are no-ops.
@@ -129,7 +190,7 @@ export const DB_PATH =
  * better-sqlite3's native binary cannot be loaded.
  */
 export function initDb(): void {
-  if (dbAvailable) return;
+  if (_dbAvailable) return;
 
   try {
     // Dynamic import keeps the module loadable even when the native
@@ -138,47 +199,13 @@ export function initDb(): void {
     const BetterSqlite3 = require("better-sqlite3") as typeof import("better-sqlite3");
     db = new BetterSqlite3(DB_PATH);
     db.exec(CREATE_TABLE);
-
-    stmts = {
-      upsert: db.prepare(`
-        INSERT INTO calls (
-          call_id, user_id, to_number, from_number,
-          direction, status, started_at, ended_at,
-          duration, transcript, metrics
-        ) VALUES (
-          @call_id, @user_id, @to_number, @from_number,
-          @direction, @status, @started_at, @ended_at,
-          @duration, @transcript, @metrics
-        )
-        ON CONFLICT(call_id) DO UPDATE SET
-          user_id      = excluded.user_id,
-          to_number    = excluded.to_number,
-          from_number  = excluded.from_number,
-          direction    = excluded.direction,
-          status       = excluded.status,
-          started_at   = excluded.started_at,
-          ended_at     = excluded.ended_at,
-          duration     = excluded.duration,
-          transcript   = excluded.transcript,
-          metrics      = excluded.metrics
-      `),
-      selectOne: db.prepare(
-        "SELECT * FROM calls WHERE call_id = ?",
-      ),
-      selectByUser: db.prepare(
-        "SELECT * FROM calls WHERE user_id = ? ORDER BY started_at DESC",
-      ),
-      selectAll: db.prepare(
-        "SELECT * FROM calls ORDER BY started_at DESC",
-      ),
-    };
-
-    dbAvailable = true;
-    process.stderr.write(`[patter-db] SQLite ready at ${DB_PATH}\n`);
+    stmts = prepareStatements(db);
+    _dbAvailable = true;
+    log(`SQLite ready at ${DB_PATH}`);
   } catch (err) {
-    process.stderr.write(
-      `[patter-db] WARNING: SQLite unavailable — falling back to in-memory mode. ` +
-      `Reason: ${err instanceof Error ? err.message : String(err)}\n`,
+    log(
+      `WARNING: SQLite unavailable — falling back to in-memory mode. ` +
+      `Reason: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 }
@@ -188,7 +215,7 @@ export function initDb(): void {
  * No-op when DB is unavailable.
  */
 export function upsertCall(record: CallRecord): void {
-  if (!dbAvailable || !stmts) return;
+  if (!_dbAvailable || !stmts) return;
   const row = recordToRow(record);
   stmts.upsert.run(row);
 }
@@ -198,7 +225,7 @@ export function upsertCall(record: CallRecord): void {
  * Returns `undefined` when not found or DB is unavailable.
  */
 export function getCall(callId: string): CallRecord | undefined {
-  if (!dbAvailable || !stmts) return undefined;
+  if (!_dbAvailable || !stmts) return undefined;
   const row = stmts.selectOne.get(callId) as CallRow | undefined;
   return row ? rowToRecord(row) : undefined;
 }
@@ -208,7 +235,7 @@ export function getCall(callId: string): CallRecord | undefined {
  * is `undefined` (unauthenticated / admin mode).
  */
 export function getCallsByUser(userId?: string): CallRecord[] {
-  if (!dbAvailable || !stmts) return [];
+  if (!_dbAvailable || !stmts) return [];
   const rows =
     userId !== undefined
       ? (stmts.selectByUser.all(userId) as CallRow[])
@@ -220,6 +247,6 @@ export function getCallsByUser(userId?: string): CallRecord[] {
  * Return every call record in the database.
  */
 export function getAllCalls(): CallRecord[] {
-  if (!dbAvailable || !stmts) return [];
+  if (!_dbAvailable || !stmts) return [];
   return (stmts.selectAll.all() as CallRow[]).map(rowToRecord);
 }

@@ -19,8 +19,7 @@ import {
   upsertCall,
   getCall,
   getCallsByUser,
-  getAllCalls,
-  dbAvailable,
+  isDbAvailable,
 } from "./db.js";
 
 export interface CallRecord {
@@ -313,7 +312,7 @@ export class PatterServer {
    * Falls back to the in-memory Map when the DB is unavailable.
    */
   getCallsForUser(userId?: string): ReadonlyMap<string, CallRecord> {
-    if (dbAvailable) {
+    if (isDbAvailable()) {
       const records = getCallsByUser(userId);
       const result = new Map<string, CallRecord>();
       for (const r of records) {
@@ -341,7 +340,7 @@ export class PatterServer {
   getCallForUser(callId: string, userId?: string): CallRecord | undefined {
     let record: CallRecord | undefined;
 
-    if (dbAvailable) {
+    if (isDbAvailable()) {
       record = getCall(callId);
     } else {
       record = this.calls.get(callId);

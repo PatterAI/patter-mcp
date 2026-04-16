@@ -52,6 +52,11 @@ function liveDuration(call: CallRecord): string {
   return formatDuration(call.duration);
 }
 
+/** Escape characters that could break Markdown formatting in transcript text. */
+function escapeMd(s: string): string {
+  return s.replace(/[`[\]<>]/g, "\\$&");
+}
+
 // ---------------------------------------------------------------------------
 // Markdown builders
 // ---------------------------------------------------------------------------
@@ -207,7 +212,7 @@ function buildCallDetailMarkdown(call: CallRecord): string {
     lines.push("## Transcript", "");
     for (const turn of call.transcript) {
       const speaker = turn.role === "assistant" ? "🤖 **Agent**" : "👤 **User**";
-      lines.push(`${speaker}: ${turn.text}`, "");
+      lines.push(`${speaker}: ${escapeMd(turn.text)}`, "");
     }
   } else if (call.status === "in-progress") {
     lines.push("## Transcript", "", "_Call is in progress. Transcript will be available after the call ends._");
@@ -225,13 +230,11 @@ function buildCallDetailMarkdown(call: CallRecord): string {
 /**
  * Build a self-contained HTML template for the call dashboard widget.
  *
- * The template fetches JSON from the /api/dashboard endpoint (served by Hono)
- * and renders the dashboard using vanilla JS + inline CSS.
+ * The template fetches JSON from /api/dashboard at runtime using
+ * window.location.origin, so no server URL needs to be baked in.
  * It auto-refreshes every 5 seconds to show live call status changes.
  */
-function buildWidgetHtml(serverBaseUrl: string): string {
-  const apiUrl = `${serverBaseUrl}/api/dashboard`;
-
+function buildWidgetHtml(): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -280,7 +283,7 @@ function buildWidgetHtml(serverBaseUrl: string): string {
   <p class="refresh" id="refreshLabel"></p>
 
   <script>
-    const API = ${JSON.stringify(apiUrl)};
+    const API = window.location.origin + '/api/dashboard';
     let lastFetch = null;
 
     function badge(status) {
@@ -288,7 +291,7 @@ function buildWidgetHtml(serverBaseUrl: string): string {
                 : status === 'ringing'     ? 'badge-ringing'
                 : status === 'failed'      ? 'badge-failed'
                 : 'badge-completed';
-      return '<span class="badge ' + cls + '">' + status + '</span>';
+      return '<span class="badge ' + cls + '">' + escHtml(status) + '</span>';
     }
 
     function escHtml(s) {
@@ -340,7 +343,7 @@ function buildWidgetHtml(serverBaseUrl: string): string {
           const dur = c.duration
             ? (c.duration >= 60 ? Math.floor(c.duration/60) + 'm ' + (c.duration%60) + 's' : c.duration + 's')
             : '-';
-          const cost = c.metrics && c.metrics.cost ? '$' + c.metrics.cost.total.toFixed(4) : '-';
+          const cost = c.metrics && c.metrics.cost && typeof c.metrics.cost.total === 'number' ? '$' + c.metrics.cost.total.toFixed(4) : '-';
           const dir = c.direction === 'outbound' ? 'OUT' : 'IN';
           const num = c.direction === 'outbound' ? (c.to || '-') : (c.from || '-');
           html += '<tr>';
@@ -476,9 +479,18 @@ export function registerCallDashboard(
 
   // -- 3. JSON API endpoint for the HTML widget ------------------------------
   // The MCP Apps widget fetches from /api/dashboard to get live data.
-  // We expose call records as a sanitised JSON array (no PII beyond what's
-  // already in get_calls, and only for the server operator).
+  // When AUTH0_DOMAIN is configured the server is in authenticated mode;
+  // direct HTTP access to this endpoint is disabled so callers must use
+  // the patter://dashboard MCP resource instead (which is auth-gated by
+  // the MCP layer). In local dev (no AUTH0_DOMAIN) the endpoint is open.
   server.app.get("/api/dashboard", (c) => {
+    if (process.env.AUTH0_DOMAIN) {
+      return c.json(
+        { error: "Dashboard API requires authentication. Use the patter://dashboard MCP resource instead." },
+        403,
+      );
+    }
+
     const calls = patter.getCallsForUser(undefined);
     const payload = Array.from(calls.values()).map((call) => {
       const metrics = call.metrics as Record<string, Record<string, number>> | undefined;
@@ -501,9 +513,8 @@ export function registerCallDashboard(
   });
 
   // -- 4. MCP Apps UI widget -------------------------------------------------
-  // serverBaseUrl is set after listen(); default to localhost:3000 when not yet known.
-  const baseUrl = server.serverBaseUrl ?? `http://${server.serverHost ?? "localhost"}:${server.serverPort ?? 3000}`;
-
+  // The widget derives the API base URL at runtime via window.location.origin,
+  // so no server URL needs to be baked into the HTML at registration time.
   server.uiResource({
     type: "mcpApps",
     name: "call-dashboard-widget",
@@ -512,7 +523,7 @@ export function registerCallDashboard(
       "Interactive call dashboard showing active calls with live status, " +
       "call history with duration and cost per call, and an aggregate cost summary. " +
       "Auto-refreshes every 5 seconds.",
-    htmlTemplate: buildWidgetHtml(baseUrl),
+    htmlTemplate: buildWidgetHtml(),
     exposeAsTool: false,
     metadata: {
       prefersBorder: true,

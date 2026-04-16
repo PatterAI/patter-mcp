@@ -1,11 +1,27 @@
 /**
  * Patter SDK wrapper — manages the embedded server, outbound calls,
  * and call record tracking.
+ *
+ * Persistence strategy:
+ *   - Every status change is written to SQLite via upsertCall().
+ *   - An in-memory Map acts as a write-through cache so that
+ *     waitForCallEnd() can poll active calls without hitting the DB.
+ *   - get_calls and get_transcript read from the DB (which includes
+ *     calls from previous runs). When the DB is unavailable the Map
+ *     is used directly as a fallback.
  */
 
 import { Patter } from "getpatter";
 import { allVoiceTools } from "./voice-tools.js";
 import { endCallSession } from "./claude-bridge.js";
+import {
+  initDb,
+  upsertCall,
+  getCall,
+  getCallsByUser,
+  getAllCalls,
+  dbAvailable,
+} from "./db.js";
 
 export interface CallRecord {
   callId: string;
@@ -36,9 +52,28 @@ function log(msg: string): void {
   process.stderr.write(`[patter-mcp] ${msg}\n`);
 }
 
+// ---------------------------------------------------------------------------
+// Immutable helpers
+// ---------------------------------------------------------------------------
+
+/** Return a new CallRecord with the given fields merged in (never mutates). */
+function mergeRecord(
+  base: CallRecord,
+  patch: Partial<CallRecord>,
+): CallRecord {
+  return { ...base, ...patch };
+}
+
 export class PatterServer {
   private phone: Patter;
   private serverRunning = false;
+
+  /**
+   * Write-through cache for active calls.
+   * Used by waitForCallEnd() to poll without hitting the DB on every tick.
+   * Completed / failed calls remain here for the process lifetime as a
+   * fast-path fallback when the DB is unavailable.
+   */
   readonly calls = new Map<string, CallRecord>();
 
   constructor() {
@@ -65,6 +100,24 @@ export class PatterServer {
       deepgramKey,
       elevenlabsKey,
     } as Record<string, unknown>);
+
+    // Initialise SQLite — errors are caught internally and set dbAvailable=false
+    initDb();
+  }
+
+  // -------------------------------------------------------------------------
+  // Private helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Persist a record to both the in-memory cache and the DB (if available).
+   * Always returns the same record unchanged — callers should replace their
+   * local reference with what they pass in (immutability contract).
+   */
+  private persist(record: CallRecord): CallRecord {
+    this.calls.set(record.callId, record);
+    upsertCall(record);
+    return record;
   }
 
   /** Create a Patter agent with voice tools attached. */
@@ -94,6 +147,10 @@ export class PatterServer {
     } as Record<string, unknown>);
   }
 
+  // -------------------------------------------------------------------------
+  // Public server management
+  // -------------------------------------------------------------------------
+
   /**
    * Start the inbound call server in background.
    *
@@ -120,7 +177,8 @@ export class PatterServer {
           const callId =
             (data.call_id as string) ||
             `inbound_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-          this.calls.set(callId, {
+
+          const record: CallRecord = {
             callId,
             from: data.caller as string,
             to: data.callee as string,
@@ -128,21 +186,26 @@ export class PatterServer {
             status: "in-progress",
             startedAt: Date.now(),
             transcript: [],
-          });
+          };
+
+          this.persist(record);
           log(`Inbound call ${callId} from ${data.caller}`);
         },
         onCallEnd: async (data: Record<string, unknown>) => {
           const callId = data.call_id as string;
-          const record = this.calls.get(callId);
-          if (record) {
-            record.status = "completed";
-            record.endedAt = Date.now();
-            record.duration = (data.duration as number) || 0;
-            record.transcript =
-              (data.transcript as Array<{ role: string; text: string }>) || [];
-            record.metrics =
-              (data.metrics as Record<string, unknown>) || {};
-          }
+          const existing = this.calls.get(callId);
+          if (!existing) return;
+
+          const updated = mergeRecord(existing, {
+            status: "completed",
+            endedAt: Date.now(),
+            duration: (data.duration as number) || 0,
+            transcript:
+              (data.transcript as Array<{ role: string; text: string }>) || [],
+            metrics: (data.metrics as Record<string, unknown>) || {},
+          });
+
+          this.persist(updated);
           endCallSession(callId);
           log(`Inbound call ${callId} ended`);
         },
@@ -155,6 +218,10 @@ export class PatterServer {
     this.serverRunning = true;
     log(`Patter server started on port ${port}`);
   }
+
+  // -------------------------------------------------------------------------
+  // Outbound calls
+  // -------------------------------------------------------------------------
 
   /** Place an outbound call. Returns the call ID immediately. */
   async makeCall(options: MakeCallOptions): Promise<string> {
@@ -170,7 +237,7 @@ export class PatterServer {
 
     const callId = `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-    this.calls.set(callId, {
+    const initial: CallRecord = {
       callId,
       to,
       direction: "outbound",
@@ -178,7 +245,9 @@ export class PatterServer {
       startedAt: Date.now(),
       transcript: [],
       userId,
-    });
+    };
+
+    this.persist(initial);
 
     const agent = this.createAgent(systemPrompt, firstMessage, voice);
 
@@ -189,45 +258,71 @@ export class PatterServer {
         machineDetection,
         voicemailMessage,
         onCallStart: async (data: Record<string, unknown>) => {
-          const record = this.calls.get(callId);
-          if (record) {
-            record.status = "in-progress";
-            record.from = data.caller as string;
-          }
+          const existing = this.calls.get(callId);
+          if (!existing) return;
+
+          const updated = mergeRecord(existing, {
+            status: "in-progress",
+            from: data.caller as string,
+          });
+
+          this.persist(updated);
           log(`Call ${callId} connected`);
         },
         onCallEnd: async (data: Record<string, unknown>) => {
-          const record = this.calls.get(callId);
-          if (record) {
-            record.status = "completed";
-            record.endedAt = Date.now();
-            record.duration = (data.duration as number) || 0;
-            record.transcript =
-              (data.transcript as Array<{ role: string; text: string }>) || [];
-            record.metrics =
-              (data.metrics as Record<string, unknown>) || {};
-          }
+          const existing = this.calls.get(callId);
+          if (!existing) return;
+
+          const updated = mergeRecord(existing, {
+            status: "completed",
+            endedAt: Date.now(),
+            duration: (data.duration as number) || 0,
+            transcript:
+              (data.transcript as Array<{ role: string; text: string }>) || [],
+            metrics: (data.metrics as Record<string, unknown>) || {},
+          });
+
+          this.persist(updated);
           endCallSession(callId);
-          log(`Call ${callId} ended — ${record?.duration}s`);
+          log(`Call ${callId} ended — ${updated.duration}s`);
         },
       } as Record<string, unknown>)
       .catch((err: Error) => {
-        const record = this.calls.get(callId);
-        if (record) {
-          record.status = "failed";
-          record.endedAt = Date.now();
-        }
+        const existing = this.calls.get(callId);
+        if (!existing) return;
+
+        const failed = mergeRecord(existing, {
+          status: "failed",
+          endedAt: Date.now(),
+        });
+
+        this.persist(failed);
         log(`Call ${callId} failed: ${err.message}`);
       });
 
     return callId;
   }
 
+  // -------------------------------------------------------------------------
+  // Query methods — prefer DB, fall back to in-memory Map
+  // -------------------------------------------------------------------------
+
   /**
    * Return all calls, optionally filtered to those owned by `userId`.
-   * When `userId` is undefined every call is returned (unauthenticated mode).
+   * Reads from the DB when available so records survive restarts.
+   * Falls back to the in-memory Map when the DB is unavailable.
    */
   getCallsForUser(userId?: string): ReadonlyMap<string, CallRecord> {
+    if (dbAvailable) {
+      const records = getCallsByUser(userId);
+      const result = new Map<string, CallRecord>();
+      for (const r of records) {
+        result.set(r.callId, r);
+      }
+      return result;
+    }
+
+    // Fallback: filter the in-memory Map
     if (userId === undefined) return this.calls;
     const filtered = new Map<string, CallRecord>();
     for (const [id, record] of this.calls) {
@@ -240,33 +335,54 @@ export class PatterServer {
 
   /**
    * Return a single call record, enforcing ownership when `userId` is provided.
-   * Returns `undefined` if not found or if the call is owned by a different user.
+   * Reads from the DB when available so records survive restarts.
+   * Falls back to the in-memory Map when the DB is unavailable.
    */
   getCallForUser(callId: string, userId?: string): CallRecord | undefined {
-    const record = this.calls.get(callId);
+    let record: CallRecord | undefined;
+
+    if (dbAvailable) {
+      record = getCall(callId);
+    } else {
+      record = this.calls.get(callId);
+    }
+
     if (!record) return undefined;
     if (userId !== undefined && record.userId !== userId) return undefined;
     return record;
   }
 
+  // -------------------------------------------------------------------------
+  // Test helpers
+  // -------------------------------------------------------------------------
+
   /** Simulate a call completing (for testing without real Twilio). */
   simulateCallEnd(callId: string, transcript?: Array<{ role: string; text: string }>): void {
-    const record = this.calls.get(callId);
-    if (!record) return;
-    record.status = "completed";
-    record.endedAt = Date.now();
-    record.duration = Math.round((Date.now() - record.startedAt) / 1000);
-    record.transcript = transcript || [
-      { role: "assistant", text: "Hello, how can I help?" },
-      { role: "user", text: "This is a test call." },
-      { role: "assistant", text: "Got it, test call completed successfully." },
-    ];
-    record.metrics = {
-      cost: { stt: 0.001, tts: 0.002, llm: 0.005, telephony: 0.01, total: 0.018 },
-      latency_avg: { stt_ms: 90, llm_ms: 250, tts_ms: 70, total_ms: 410 },
-    };
+    const existing = this.calls.get(callId);
+    if (!existing) return;
+
+    const completed = mergeRecord(existing, {
+      status: "completed",
+      endedAt: Date.now(),
+      duration: Math.round((Date.now() - existing.startedAt) / 1000),
+      transcript: transcript ?? [
+        { role: "assistant", text: "Hello, how can I help?" },
+        { role: "user", text: "This is a test call." },
+        { role: "assistant", text: "Got it, test call completed successfully." },
+      ],
+      metrics: {
+        cost: { stt: 0.001, tts: 0.002, llm: 0.005, telephony: 0.01, total: 0.018 },
+        latency_avg: { stt_ms: 90, llm_ms: 250, tts_ms: 70, total_ms: 410 },
+      },
+    });
+
+    this.persist(completed);
     log(`Call ${callId} simulated complete`);
   }
+
+  // -------------------------------------------------------------------------
+  // Autonomous third-party call
+  // -------------------------------------------------------------------------
 
   /** Call a third party autonomously and wait for the call to complete. */
   async callThirdParty(
@@ -284,13 +400,14 @@ export class PatterServer {
     return this.waitForCallEnd(callId, 300_000);
   }
 
-  /** Wait for a call to complete (polling). */
+  /** Wait for a call to complete (polling against the in-memory cache). */
   async waitForCallEnd(
     callId: string,
     timeoutMs: number,
   ): Promise<CallRecord> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
+      // Poll the in-memory cache — it is always current for active calls
       const record = this.calls.get(callId);
       if (!record) throw new Error(`Call ${callId} not found`);
       if (record.status === "completed" || record.status === "failed") {
@@ -300,6 +417,10 @@ export class PatterServer {
     }
     throw new Error(`Call ${callId} timed out after ${timeoutMs / 1000}s`);
   }
+
+  // -------------------------------------------------------------------------
+  // Accessors
+  // -------------------------------------------------------------------------
 
   get phoneNumber(): string {
     return process.env.TWILIO_PHONE_NUMBER || "unknown";

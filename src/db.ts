@@ -1,0 +1,225 @@
+/**
+ * SQLite persistence layer for call records.
+ *
+ * Uses better-sqlite3 (synchronous) for local storage.
+ * Gracefully falls back to a no-op in-memory mode if the
+ * native binary is unavailable (e.g. some container environments).
+ */
+
+import type { CallRecord } from "./patter-server.js";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** A row as stored in the calls table (snake_case, JSON-serialised fields). */
+interface CallRow {
+  call_id: string;
+  user_id: string | null;
+  to_number: string | null;
+  from_number: string | null;
+  direction: string;
+  status: string;
+  started_at: number;
+  ended_at: number | null;
+  duration: number | null;
+  transcript: string | null;
+  metrics: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Schema
+// ---------------------------------------------------------------------------
+
+const CREATE_TABLE = `
+CREATE TABLE IF NOT EXISTS calls (
+  call_id    TEXT PRIMARY KEY,
+  user_id    TEXT,
+  to_number  TEXT,
+  from_number TEXT,
+  direction  TEXT NOT NULL CHECK(direction IN ('outbound', 'inbound')),
+  status     TEXT NOT NULL CHECK(status IN ('ringing', 'in-progress', 'completed', 'failed')),
+  started_at INTEGER NOT NULL,
+  ended_at   INTEGER,
+  duration   INTEGER,
+  transcript TEXT,
+  metrics    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_calls_user_id ON calls(user_id);
+CREATE INDEX IF NOT EXISTS idx_calls_status  ON calls(status);
+`.trim();
+
+// ---------------------------------------------------------------------------
+// Row <-> CallRecord conversion (immutable — always return new objects)
+// ---------------------------------------------------------------------------
+
+function rowToRecord(row: CallRow): CallRecord {
+  return {
+    callId: row.call_id,
+    userId: row.user_id ?? undefined,
+    to: row.to_number ?? undefined,
+    from: row.from_number ?? undefined,
+    direction: row.direction as CallRecord["direction"],
+    status: row.status as CallRecord["status"],
+    startedAt: row.started_at,
+    endedAt: row.ended_at ?? undefined,
+    duration: row.duration ?? undefined,
+    transcript: row.transcript
+      ? (JSON.parse(row.transcript) as Array<{ role: string; text: string }>)
+      : [],
+    metrics: row.metrics
+      ? (JSON.parse(row.metrics) as Record<string, unknown>)
+      : undefined,
+  };
+}
+
+function recordToRow(r: CallRecord): CallRow {
+  return {
+    call_id: r.callId,
+    user_id: r.userId ?? null,
+    to_number: r.to ?? null,
+    from_number: r.from ?? null,
+    direction: r.direction,
+    status: r.status,
+    started_at: r.startedAt,
+    ended_at: r.endedAt ?? null,
+    duration: r.duration ?? null,
+    transcript: JSON.stringify(r.transcript),
+    metrics: r.metrics !== undefined ? JSON.stringify(r.metrics) : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// DB handle (module-level singleton)
+// ---------------------------------------------------------------------------
+
+type Database = import("better-sqlite3").Database;
+type Statement = import("better-sqlite3").Statement;
+
+interface Statements {
+  upsert: Statement;
+  selectOne: Statement;
+  selectByUser: Statement;
+  selectAll: Statement;
+}
+
+let db: Database | undefined;
+let stmts: Statements | undefined;
+
+/** True when the SQLite database initialised successfully. */
+export let dbAvailable = false;
+
+// ---------------------------------------------------------------------------
+// Exported path so callers / tests can inspect where the DB lives
+// ---------------------------------------------------------------------------
+
+export const DB_PATH =
+  process.env.PATTER_DB_PATH ?? "patter-mcp.db";
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Initialise the SQLite connection and create tables.
+ * Safe to call multiple times — subsequent calls are no-ops.
+ *
+ * Falls back to a no-op in-memory mode and logs a warning when
+ * better-sqlite3's native binary cannot be loaded.
+ */
+export function initDb(): void {
+  if (dbAvailable) return;
+
+  try {
+    // Dynamic import keeps the module loadable even when the native
+    // binary is missing — the error only surfaces here, not at import time.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const BetterSqlite3 = require("better-sqlite3") as typeof import("better-sqlite3");
+    db = new BetterSqlite3(DB_PATH);
+    db.exec(CREATE_TABLE);
+
+    stmts = {
+      upsert: db.prepare(`
+        INSERT INTO calls (
+          call_id, user_id, to_number, from_number,
+          direction, status, started_at, ended_at,
+          duration, transcript, metrics
+        ) VALUES (
+          @call_id, @user_id, @to_number, @from_number,
+          @direction, @status, @started_at, @ended_at,
+          @duration, @transcript, @metrics
+        )
+        ON CONFLICT(call_id) DO UPDATE SET
+          user_id      = excluded.user_id,
+          to_number    = excluded.to_number,
+          from_number  = excluded.from_number,
+          direction    = excluded.direction,
+          status       = excluded.status,
+          started_at   = excluded.started_at,
+          ended_at     = excluded.ended_at,
+          duration     = excluded.duration,
+          transcript   = excluded.transcript,
+          metrics      = excluded.metrics
+      `),
+      selectOne: db.prepare(
+        "SELECT * FROM calls WHERE call_id = ?",
+      ),
+      selectByUser: db.prepare(
+        "SELECT * FROM calls WHERE user_id = ? ORDER BY started_at DESC",
+      ),
+      selectAll: db.prepare(
+        "SELECT * FROM calls ORDER BY started_at DESC",
+      ),
+    };
+
+    dbAvailable = true;
+    process.stderr.write(`[patter-db] SQLite ready at ${DB_PATH}\n`);
+  } catch (err) {
+    process.stderr.write(
+      `[patter-db] WARNING: SQLite unavailable — falling back to in-memory mode. ` +
+      `Reason: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+}
+
+/**
+ * Insert or update a call record in the database.
+ * No-op when DB is unavailable.
+ */
+export function upsertCall(record: CallRecord): void {
+  if (!dbAvailable || !stmts) return;
+  const row = recordToRow(record);
+  stmts.upsert.run(row);
+}
+
+/**
+ * Retrieve a single call by ID.
+ * Returns `undefined` when not found or DB is unavailable.
+ */
+export function getCall(callId: string): CallRecord | undefined {
+  if (!dbAvailable || !stmts) return undefined;
+  const row = stmts.selectOne.get(callId) as CallRow | undefined;
+  return row ? rowToRecord(row) : undefined;
+}
+
+/**
+ * Return all calls belonging to `userId`, or every call when `userId`
+ * is `undefined` (unauthenticated / admin mode).
+ */
+export function getCallsByUser(userId?: string): CallRecord[] {
+  if (!dbAvailable || !stmts) return [];
+  const rows =
+    userId !== undefined
+      ? (stmts.selectByUser.all(userId) as CallRow[])
+      : (stmts.selectAll.all() as CallRow[]);
+  return rows.map(rowToRecord);
+}
+
+/**
+ * Return every call record in the database.
+ */
+export function getAllCalls(): CallRecord[] {
+  if (!dbAvailable || !stmts) return [];
+  return (stmts.selectAll.all() as CallRow[]).map(rowToRecord);
+}

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { PatterServer } from "../patter-server.js";
+import type { PatterServer, MakeCallOptions } from "../patter-server.js";
 
 // TODO: remove cast when zod v4 is adopted
 type ZodAny = z.ZodTypeAny;
@@ -21,15 +21,16 @@ export async function makeCallHandler(
   userId?: string,
 ) {
   try {
-    const callId = await patter.makeCall(
-      args.to,
-      args.systemPrompt,
-      args.firstMessage,
-      args.voice,
-      args.machineDetection,
-      args.voicemailMessage,
+    const callOptions: MakeCallOptions = {
+      to: args.to,
+      systemPrompt: args.systemPrompt,
+      firstMessage: args.firstMessage,
+      voice: args.voice,
+      machineDetection: args.machineDetection,
+      voicemailMessage: args.voicemailMessage,
       userId,
-    );
+    };
+    const callId = await patter.makeCall(callOptions);
 
     return {
       content: [

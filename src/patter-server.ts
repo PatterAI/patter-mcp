@@ -22,6 +22,16 @@ export interface CallRecord {
   userId?: string;
 }
 
+export interface MakeCallOptions {
+  to: string;
+  systemPrompt: string;
+  firstMessage?: string;
+  voice?: string;
+  machineDetection?: boolean;
+  voicemailMessage?: string;
+  userId?: string;
+}
+
 function log(msg: string): void {
   process.stderr.write(`[patter-mcp] ${msg}\n`);
 }
@@ -84,7 +94,13 @@ export class PatterServer {
     } as Record<string, unknown>);
   }
 
-  /** Start the inbound call server in background. */
+  /**
+   * Start the inbound call server in background.
+   *
+   * Note: inbound calls intentionally have no userId — they originate from
+   * Twilio, not from an authenticated MCP client, so there is no Auth0
+   * identity to associate with them.
+   */
   async startServer(
     systemPrompt: string,
     firstMessage?: string,
@@ -141,15 +157,17 @@ export class PatterServer {
   }
 
   /** Place an outbound call. Returns the call ID immediately. */
-  async makeCall(
-    to: string,
-    systemPrompt: string,
-    firstMessage?: string,
-    voice?: string,
-    machineDetection?: boolean,
-    voicemailMessage?: string,
-    userId?: string,
-  ): Promise<string> {
+  async makeCall(options: MakeCallOptions): Promise<string> {
+    const {
+      to,
+      systemPrompt,
+      firstMessage,
+      voice,
+      machineDetection,
+      voicemailMessage,
+      userId,
+    } = options;
+
     const callId = `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
     this.calls.set(callId, {
@@ -262,7 +280,7 @@ export class PatterServer {
       `Be polite, concise, and focused on the task. When the task is complete ` +
       `or you have the information needed, thank them and end the call.`;
 
-    const callId = await this.makeCall(to, systemPrompt, undefined, voice, undefined, undefined, userId);
+    const callId = await this.makeCall({ to, systemPrompt, voice, userId });
     return this.waitForCallEnd(callId, 300_000);
   }
 

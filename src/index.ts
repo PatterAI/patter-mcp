@@ -22,6 +22,16 @@ function log(msg: string): void {
   process.stderr.write(`[patter-mcp] ${msg}\n`);
 }
 
+/**
+ * Extract the userId from the MCP request context, guarding against empty
+ * strings that could slip through as "authenticated" user identifiers.
+ * Returns `undefined` when auth is disabled or the userId is blank.
+ */
+function extractUserId(ctx: { auth?: { user: { userId: string } } }): string | undefined {
+  const raw = ctx.auth?.user.userId;
+  return raw?.trim() || undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Shared Patter server instance
 // ---------------------------------------------------------------------------
@@ -68,7 +78,7 @@ server.tool(
     schema: makeCallSchema,
   },
   async (args: MakeCallInput, ctx) => {
-    const userId = ctx.auth?.user.userId;
+    const userId = extractUserId(ctx);
     return makeCallHandler(args, patter, userId);
   },
 );
@@ -84,7 +94,7 @@ server.tool(
     schema: callThirdPartySchema,
   },
   async (args: CallThirdPartyInput, ctx) => {
-    const userId = ctx.auth?.user.userId;
+    const userId = extractUserId(ctx);
     return callThirdPartyHandler(args, patter, userId);
   },
 );
@@ -96,7 +106,7 @@ server.tool(
     description: "List all recent calls with their status, duration, cost, and turn count.",
   },
   async (_args, ctx) => {
-    const userId = ctx.auth?.user.userId;
+    const userId = extractUserId(ctx);
     return getCallsHandler(patter, userId);
   },
 );
@@ -109,7 +119,7 @@ server.tool(
     schema: getTranscriptSchema,
   },
   async (args: GetTranscriptInput, ctx) => {
-    const userId = ctx.auth?.user.userId;
+    const userId = extractUserId(ctx);
     return getTranscriptHandler(args, patter, userId);
   },
 );
@@ -126,7 +136,6 @@ server.app.get("/health", (c) =>
     phone: patter.phoneNumber,
     serverRunning: patter.isServerRunning,
     activeSessions: server.sessions.size,
-    totalCalls: patter.calls.size,
   }),
 );
 

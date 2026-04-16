@@ -16,6 +16,7 @@ import { getCallsHandler } from "./tools/get-calls.js";
 import { getTranscriptHandler, getTranscriptSchema, type GetTranscriptInput } from "./tools/get-transcript.js";
 import { validatePhoneNumber } from "./phone-validation.js";
 import { checkRateLimit, recordCallStart } from "./rate-limiter.js";
+import { registerCallDashboard } from "./resources/call-dashboard.js";
 
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? "3000", 10);
 const PATTER_PORT = parseInt(process.env.PATTER_PORT ?? "8000", 10);
@@ -165,6 +166,12 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
+// Call dashboard resources + MCP Apps widget
+// ---------------------------------------------------------------------------
+
+registerCallDashboard(server, patter);
+
+// ---------------------------------------------------------------------------
 // Custom HTTP routes via Hono app
 // ---------------------------------------------------------------------------
 
@@ -220,6 +227,8 @@ Patter MCP Server
   log(`  claude mcp add --transport http patter-mcp http://localhost:${MCP_PORT}/mcp`);
   log(``);
   log(`Tools: make_call, call_third_party, get_calls, get_transcript`);
+  log(`Resources: patter://dashboard, patter://call/{callId}`);
+  log(`Widget: call-dashboard-widget (MCP Apps / ChatGPT)`);
   log(`Voice tools (during calls): read_file, run_command, search_code`);
   log(`Auth: ${oauthConfig ? `Auth0 (${process.env.AUTH0_DOMAIN})` : "disabled (no AUTH0_DOMAIN)"}`);
 }

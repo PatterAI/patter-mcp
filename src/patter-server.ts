@@ -286,7 +286,7 @@ export class PatterServer {
           durationTimer = setTimeout(() => {
             log(
               `WARNING: Call ${callId} exceeded maximum duration ` +
-                `(${MAX_CALL_DURATION_SECONDS}s) — force-terminating.`,
+                `(${MAX_CALL_DURATION_SECONDS}s) — marking call as completed and ending agent session — carrier connection may continue.`,
             );
             decrementConcurrent(userId);
 
@@ -436,7 +436,7 @@ export class PatterServer {
       `or you have the information needed, thank them and end the call.`;
 
     const callId = await this.makeCall({ to, systemPrompt, voice, userId });
-    return this.waitForCallEnd(callId, 300_000);
+    return this.waitForCallEnd(callId, MAX_CALL_DURATION_SECONDS * 1000 + 10_000);
   }
 
   /** Wait for a call to complete (polling against the in-memory cache). */

@@ -18,17 +18,34 @@ import {
 } from "./db.js";
 
 // ---------------------------------------------------------------------------
+// Config validation helpers
+// ---------------------------------------------------------------------------
+
+function parsePositiveInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined) return fallback;
+  const parsed = parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    throw new Error(`Invalid config: ${name}="${raw}" must be a non-negative integer`);
+  }
+  return parsed;
+}
+
+function parsePositiveFloat(raw: string | undefined, name: string): number | undefined {
+  if (raw === undefined) return undefined;
+  const parsed = parseFloat(raw);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    throw new Error(`Invalid config: ${name}="${raw}" must be a non-negative number`);
+  }
+  return parsed;
+}
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-const RATE_LIMIT_DAILY = parseInt(process.env.RATE_LIMIT_DAILY ?? "10", 10);
-const MAX_CONCURRENT_CALLS = parseInt(
-  process.env.MAX_CONCURRENT_CALLS ?? "2",
-  10,
-);
-const HOURLY_BUDGET_CAP_USD = process.env.HOURLY_BUDGET_CAP_USD
-  ? parseFloat(process.env.HOURLY_BUDGET_CAP_USD)
-  : undefined;
+const RATE_LIMIT_DAILY = parsePositiveInt(process.env.RATE_LIMIT_DAILY, 10, "RATE_LIMIT_DAILY");
+const MAX_CONCURRENT_CALLS = parsePositiveInt(process.env.MAX_CONCURRENT_CALLS, 2, "MAX_CONCURRENT_CALLS");
+const HOURLY_BUDGET_CAP_USD = parsePositiveFloat(process.env.HOURLY_BUDGET_CAP_USD, "HOURLY_BUDGET_CAP_USD");
 
 // ---------------------------------------------------------------------------
 // Types
@@ -63,6 +80,11 @@ function utcHourStartMs(): number {
 // ---------------------------------------------------------------------------
 // In-memory fallback counters (used when DB is unavailable)
 // ---------------------------------------------------------------------------
+
+// NOTE: If the DB becomes unavailable *after* calls have already been started
+// in DB mode, the in-memory concurrent counter will be inaccurate because
+// those ongoing calls were never tracked here. The in-memory fallback is only
+// reliable when it has been the active tracking mechanism from the start.
 
 const memoryDailyCount: Map<string, { date: string; count: number }> =
   new Map();
@@ -216,7 +238,8 @@ function checkRateLimitMemory(userId: string): RateLimitResult {
 // Re-export config for use elsewhere (e.g. duration enforcement)
 // ---------------------------------------------------------------------------
 
-export const MAX_CALL_DURATION_SECONDS = parseInt(
-  process.env.MAX_CALL_DURATION_SECONDS ?? "300",
-  10,
+export const MAX_CALL_DURATION_SECONDS = parsePositiveInt(
+  process.env.MAX_CALL_DURATION_SECONDS,
+  300,
+  "MAX_CALL_DURATION_SECONDS",
 );

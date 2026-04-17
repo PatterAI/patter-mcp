@@ -1,35 +1,36 @@
 import { z } from "zod";
-import type { PatterServer } from "../patter-server.js";
+import type { PatterServer, MakeCallOptions } from "../patter-server.js";
 
-export const makeCallSchema = {
+// TODO: remove cast when zod v4 is adopted
+type ZodAny = z.ZodTypeAny;
+
+export const makeCallSchema = z.object({
   to: z.string().describe("Phone number to call in E.164 format (e.g. +15551234567)"),
   systemPrompt: z.string().describe("Instructions for the AI voice agent on the call"),
   firstMessage: z.string().optional().describe("Opening message when the callee answers"),
   voice: z.string().optional().describe("TTS voice name (e.g. alloy, nova, shimmer)"),
   machineDetection: z.boolean().optional().describe("Enable answering machine detection"),
   voicemailMessage: z.string().optional().describe("Message to leave on voicemail"),
-};
+}) as unknown as ZodAny;
+
+export type MakeCallInput = z.infer<typeof makeCallSchema>;
 
 export async function makeCallHandler(
-  args: {
-    to: string;
-    systemPrompt: string;
-    firstMessage?: string;
-    voice?: string;
-    machineDetection?: boolean;
-    voicemailMessage?: string;
-  },
+  args: MakeCallInput,
   patter: PatterServer,
+  userId?: string,
 ) {
   try {
-    const callId = await patter.makeCall(
-      args.to,
-      args.systemPrompt,
-      args.firstMessage,
-      args.voice,
-      args.machineDetection,
-      args.voicemailMessage,
-    );
+    const callOptions: MakeCallOptions = {
+      to: args.to,
+      systemPrompt: args.systemPrompt,
+      firstMessage: args.firstMessage,
+      voice: args.voice,
+      machineDetection: args.machineDetection,
+      voicemailMessage: args.voicemailMessage,
+      userId,
+    };
+    const callId = await patter.makeCall(callOptions);
 
     return {
       content: [

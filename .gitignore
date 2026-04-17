@@ -5,3 +5,8 @@ __pycache__/
 dist/
 .DS_Store
 .worktrees/
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal

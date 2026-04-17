@@ -1,197 +1,190 @@
 /**
- * Patter MCP Server — Streamable HTTP transport
+ * Patter MCP Server — mcp-use transport
  *
- * Always-online Express server that exposes MCP tools for voice calling
- * via the Streamable HTTP transport. Claude Code connects with:
+ * Uses MCPServer from mcp-use/server for session management, transport,
+ * and the built-in inspector UI. Claude Code connects with:
  *
  *   claude mcp add --transport http patter-mcp http://localhost:3000/mcp
  */
 
-import express from "express";
-import { randomUUID } from "node:crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { MCPServer, oauthAuth0Provider } from "mcp-use/server";
 
 import { PatterServer } from "./patter-server.js";
-import { makeCallSchema, makeCallHandler } from "./tools/make-call.js";
-import { callThirdPartySchema, callThirdPartyHandler } from "./tools/call-third-party.js";
+import { makeCallHandler, makeCallSchema, type MakeCallInput } from "./tools/make-call.js";
+import { callThirdPartyHandler, callThirdPartySchema, type CallThirdPartyInput } from "./tools/call-third-party.js";
 import { getCallsHandler } from "./tools/get-calls.js";
-import { getTranscriptSchema, getTranscriptHandler } from "./tools/get-transcript.js";
+import { getTranscriptHandler, getTranscriptSchema, type GetTranscriptInput } from "./tools/get-transcript.js";
+import { validatePhoneNumber } from "./phone-validation.js";
+import { checkRateLimit, recordCallStart } from "./rate-limiter.js";
+import { registerCallDashboard } from "./resources/call-dashboard.js";
 
-const MCP_PORT = parseInt(process.env.MCP_PORT || "3000", 10);
-const PATTER_PORT = parseInt(process.env.PATTER_PORT || "8000", 10);
+const MCP_PORT = parseInt(process.env.MCP_PORT ?? "3000", 10);
+const PATTER_PORT = parseInt(process.env.PATTER_PORT ?? "8000", 10);
 
 function log(msg: string): void {
   process.stderr.write(`[patter-mcp] ${msg}\n`);
+}
+
+/** Build a uniform MCP error response from a plain message string. */
+function errorResponse(message: string) {
+  return {
+    content: [{ type: "text" as const, text: message }],
+    isError: true,
+  };
+}
+
+/**
+ * Extract the userId from the MCP request context, guarding against empty
+ * strings that could slip through as "authenticated" user identifiers.
+ * Returns `undefined` when auth is disabled or the userId is blank.
+ */
+function extractUserId(ctx: { auth?: { user: { userId: string } } }): string | undefined {
+  const raw = ctx.auth?.user.userId;
+  return raw?.trim() || undefined;
 }
 
 // ---------------------------------------------------------------------------
 // Shared Patter server instance
 // ---------------------------------------------------------------------------
 
-let patter: PatterServer;
-try {
-  patter = new PatterServer();
-} catch (err) {
-  log(`Failed to initialize Patter: ${err instanceof Error ? err.message : String(err)}`);
-  log("Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OPENAI_API_KEY");
-  process.exit(1);
-}
+const patter: PatterServer = (() => {
+  try {
+    return new PatterServer();
+  } catch (err) {
+    log(`Failed to initialize Patter: ${err instanceof Error ? err.message : String(err)}`);
+    log("Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OPENAI_API_KEY");
+    process.exit(1);
+  }
+})();
 
 // ---------------------------------------------------------------------------
-// MCP server factory — creates a new McpServer with all tools registered
+// MCP server with mcp-use
 // ---------------------------------------------------------------------------
 
-function createMcpServer(): McpServer {
-  const server = new McpServer({
-    name: "patter-mcp",
-    version: "0.1.0",
-  });
+// OAuth is optional: when AUTH0_DOMAIN + AUTH0_AUDIENCE are set, all /mcp
+// endpoints require a valid Bearer token. When absent the server runs in
+// unauthenticated mode so local dev works without any auth configuration.
+const oauthConfig =
+  process.env.AUTH0_DOMAIN && process.env.AUTH0_AUDIENCE
+    ? oauthAuth0Provider({
+        domain: process.env.AUTH0_DOMAIN,
+        audience: process.env.AUTH0_AUDIENCE,
+      })
+    : undefined;
 
-  // -- make_call
-  server.tool(
-    "make_call",
-    "Place an outbound phone call with an AI voice agent. The agent speaks " +
+const server = new MCPServer({
+  name: "patter-mcp",
+  version: "0.2.0",
+  ...(oauthConfig !== undefined ? { oauth: oauthConfig } : {}),
+});
+
+// -- make_call
+server.tool(
+  {
+    name: "make_call",
+    description:
+      "Place an outbound phone call with an AI voice agent. The agent speaks " +
       "using the system prompt and can read files, run commands, and search " +
       "code during the call. Returns immediately with a call ID.",
-    makeCallSchema,
-    async (args) => makeCallHandler(args, patter),
-  );
+    schema: makeCallSchema,
+  },
+  async (args: MakeCallInput, ctx) => {
+    const userId = extractUserId(ctx);
 
-  // -- call_third_party
-  server.tool(
-    "call_third_party",
-    "Call a third party (restaurant, business, person) with a specific task. " +
+    const phoneResult = validatePhoneNumber(args.to);
+    if (!phoneResult.valid) {
+      return errorResponse(phoneResult.error);
+    }
+
+    const rateResult = checkRateLimit(userId);
+    if (!rateResult.allowed) {
+      return errorResponse(rateResult.reason ?? "Rate limit exceeded.");
+    }
+
+    recordCallStart(userId);
+
+    // Replace raw input with the validated E.164 number
+    const validatedArgs: MakeCallInput = { ...args, to: phoneResult.e164 };
+    return makeCallHandler(validatedArgs, patter, userId);
+  },
+);
+
+// -- call_third_party
+server.tool(
+  {
+    name: "call_third_party",
+    description:
+      "Call a third party (restaurant, business, person) with a specific task. " +
       "An autonomous AI agent handles the conversation. Waits for the call to " +
       "complete and returns the full transcript.",
-    callThirdPartySchema,
-    async (args) => callThirdPartyHandler(args, patter),
-  );
+    schema: callThirdPartySchema,
+  },
+  async (args: CallThirdPartyInput, ctx) => {
+    const userId = extractUserId(ctx);
 
-  // -- get_calls
-  server.tool(
-    "get_calls",
-    "List all recent calls with their status, duration, cost, and turn count.",
-    {},
-    async () => getCallsHandler(patter),
-  );
+    const phoneResult = validatePhoneNumber(args.to);
+    if (!phoneResult.valid) {
+      return errorResponse(phoneResult.error);
+    }
 
-  // -- get_transcript
-  server.tool(
-    "get_transcript",
-    "Get the full conversation transcript of a completed call.",
-    getTranscriptSchema,
-    async (args) => getTranscriptHandler(args, patter),
-  );
+    const rateResult = checkRateLimit(userId);
+    if (!rateResult.allowed) {
+      return errorResponse(rateResult.reason ?? "Rate limit exceeded.");
+    }
 
-  return server;
-}
+    recordCallStart(userId);
+
+    // Replace raw input with the validated E.164 number
+    const validatedArgs: CallThirdPartyInput = { ...args, to: phoneResult.e164 };
+    return callThirdPartyHandler(validatedArgs, patter, userId);
+  },
+);
+
+// -- get_calls
+server.tool(
+  {
+    name: "get_calls",
+    description: "List all recent calls with their status, duration, cost, and turn count.",
+  },
+  async (_args, ctx) => {
+    const userId = extractUserId(ctx);
+    return getCallsHandler(patter, userId);
+  },
+);
+
+// -- get_transcript
+server.tool(
+  {
+    name: "get_transcript",
+    description: "Get the full conversation transcript of a completed call.",
+    schema: getTranscriptSchema,
+  },
+  async (args: GetTranscriptInput, ctx) => {
+    const userId = extractUserId(ctx);
+    return getTranscriptHandler(args, patter, userId);
+  },
+);
 
 // ---------------------------------------------------------------------------
-// Express + Streamable HTTP transport
+// Call dashboard resources + MCP Apps widget
 // ---------------------------------------------------------------------------
 
-const app = express();
-app.use(express.json());
+registerCallDashboard(server, patter);
 
-// Session tracking
-const sessions = new Map<
-  string,
-  { transport: StreamableHTTPServerTransport; server: McpServer }
->();
-
-// POST /mcp — Client sends JSON-RPC messages
-app.post("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-  // New session: InitializeRequest without session ID
-  if (!sessionId) {
-    const body = req.body;
-    if (isInitializeRequest(body)) {
-      const newSessionId = randomUUID();
-      const transport = new StreamableHTTPServerTransport({
-        sessionId: newSessionId,
-        onsessioninitialized: (sid: string) => {
-          log(`MCP session initialized: ${sid}`);
-        },
-      });
-      const server = createMcpServer();
-
-      sessions.set(newSessionId, { transport, server });
-      await server.connect(transport);
-      await transport.handleRequest(req, res, body);
-      return;
-    }
-    res.status(400).json({ error: "Missing Mcp-Session-Id header" });
-    return;
-  }
-
-  // Existing session
-  const session = sessions.get(sessionId);
-  if (!session) {
-    res.status(404).json({ error: "Session not found" });
-    return;
-  }
-  await session.transport.handleRequest(req, res, req.body);
-});
-
-// GET /mcp — SSE stream for server-initiated messages
-app.get("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (!sessionId) {
-    res.status(400).json({ error: "Missing Mcp-Session-Id header" });
-    return;
-  }
-  const session = sessions.get(sessionId);
-  if (!session) {
-    res.status(404).json({ error: "Session not found" });
-    return;
-  }
-  await session.transport.handleRequest(req, res);
-});
-
-// DELETE /mcp — Close session
-app.delete("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (sessionId) {
-    const session = sessions.get(sessionId);
-    if (session) {
-      await session.transport.handleRequest(req, res);
-      sessions.delete(sessionId);
-      log(`MCP session closed: ${sessionId}`);
-      return;
-    }
-  }
-  res.status(200).end();
-});
-
-// Test endpoint: simulate a call completing (for development/testing)
-app.post("/test/simulate-call-end", (req, res) => {
-  const { callId, transcript } = req.body as {
-    callId?: string;
-    transcript?: Array<{ role: string; text: string }>;
-  };
-  if (!callId) {
-    res.status(400).json({ error: "callId required" });
-    return;
-  }
-  patter.simulateCallEnd(callId, transcript);
-  const record = patter.calls.get(callId);
-  res.json({ ok: true, call: record });
-});
+// ---------------------------------------------------------------------------
+// Custom HTTP routes via Hono app
+// ---------------------------------------------------------------------------
 
 // Health check
-app.get("/health", (_, res) => {
-  res.json({
+server.app.get("/health", (c) =>
+  c.json({
     status: "ok",
     mode: "mcp",
     phone: patter.phoneNumber,
     serverRunning: patter.isServerRunning,
-    activeSessions: sessions.size,
-    totalCalls: patter.calls.size,
-  });
-});
+    activeSessions: server.sessions.size,
+  }),
+);
 
 // ---------------------------------------------------------------------------
 // Start
@@ -205,15 +198,16 @@ async function main(): Promise<void> {
     "Be concise and clear — this is a phone conversation.";
 
   await patter.startServer(
-    process.env.AGENT_SYSTEM_PROMPT || defaultPrompt,
-    process.env.AGENT_FIRST_MESSAGE || "Hello! I'm your AI assistant. How can I help?",
-    process.env.AGENT_VOICE || "nova",
+    process.env.AGENT_SYSTEM_PROMPT ?? defaultPrompt,
+    process.env.AGENT_FIRST_MESSAGE ?? "Hello! I'm your AI assistant. How can I help?",
+    process.env.AGENT_VOICE ?? "nova",
     PATTER_PORT,
   );
 
-  // Start MCP HTTP server
-  app.listen(MCP_PORT, "0.0.0.0", () => {
-    log(`
+  // Start MCP HTTP server (inspector auto-available at /inspector)
+  await server.listen(MCP_PORT);
+
+  log(`
 ██████╗  █████╗ ████████╗████████╗███████╗██████╗
 ██╔══██╗██╔══██╗╚══██╔══╝╚══██╔══╝██╔════╝██╔══██╗
 ██████╔╝███████║   ██║      ██║   █████╗  ██████╔╝
@@ -223,17 +217,20 @@ async function main(): Promise<void> {
 
 Patter MCP Server
 `);
-    log(`MCP endpoint:  http://localhost:${MCP_PORT}/mcp`);
-    log(`Patter server: http://localhost:${PATTER_PORT}/`);
-    log(`Phone number:  ${patter.phoneNumber}`);
-    log(`Health check:  http://localhost:${MCP_PORT}/health`);
-    log(``);
-    log(`Connect Claude Code:`);
-    log(`  claude mcp add --transport http patter-mcp http://localhost:${MCP_PORT}/mcp`);
-    log(``);
-    log(`Tools: make_call, call_third_party, get_calls, get_transcript`);
-    log(`Voice tools (during calls): read_file, run_command, search_code`);
-  });
+  log(`MCP endpoint:  http://localhost:${MCP_PORT}/mcp`);
+  log(`Inspector:     http://localhost:${MCP_PORT}/inspector`);
+  log(`Patter server: http://localhost:${PATTER_PORT}/`);
+  log(`Phone number:  ${patter.phoneNumber}`);
+  log(`Health check:  http://localhost:${MCP_PORT}/health`);
+  log(``);
+  log(`Connect Claude Code:`);
+  log(`  claude mcp add --transport http patter-mcp http://localhost:${MCP_PORT}/mcp`);
+  log(``);
+  log(`Tools: make_call, call_third_party, get_calls, get_transcript`);
+  log(`Resources: patter://dashboard, patter://call/{callId}`);
+  log(`Widget: call-dashboard-widget (MCP Apps / ChatGPT)`);
+  log(`Voice tools (during calls): read_file, run_command, search_code`);
+  log(`Auth: ${oauthConfig ? `Auth0 (${process.env.AUTH0_DOMAIN})` : "disabled (no AUTH0_DOMAIN)"}`);
 }
 
 main().catch((err) => {

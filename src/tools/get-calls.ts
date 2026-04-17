@@ -1,7 +1,7 @@
 import type { PatterServer } from "../patter-server.js";
 
-export async function getCallsHandler(patter: PatterServer) {
-  const calls = patter.calls;
+export async function getCallsHandler(patter: PatterServer, userId?: string) {
+  const calls = patter.getCallsForUser(userId);
 
   if (calls.size === 0) {
     return {

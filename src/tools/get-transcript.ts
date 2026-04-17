@@ -1,15 +1,21 @@
 import { z } from "zod";
 import type { PatterServer } from "../patter-server.js";
 
-export const getTranscriptSchema = {
+// TODO: remove cast when zod v4 is adopted
+type ZodAny = z.ZodTypeAny;
+
+export const getTranscriptSchema = z.object({
   callId: z.string().describe("The call ID returned by make_call or shown in get_calls"),
-};
+}) as unknown as ZodAny;
+
+export type GetTranscriptInput = z.infer<typeof getTranscriptSchema>;
 
 export async function getTranscriptHandler(
-  args: { callId: string },
+  args: GetTranscriptInput,
   patter: PatterServer,
+  userId?: string,
 ) {
-  const call = patter.calls.get(args.callId);
+  const call = patter.getCallForUser(args.callId, userId);
 
   if (!call) {
     return {

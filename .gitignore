@@ -4,3 +4,11 @@ __pycache__/
 *.pyc
 dist/
 .DS_Store
+.worktrees/
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+.claude/
+CLAUDE.md

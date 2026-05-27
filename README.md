@@ -195,6 +195,37 @@ npm run build        # Build for production
 npm start            # Run built version
 ```
 
+## Distribution
+
+`patter-mcp` is distributed as a **GitHub repository**, not an npm
+package. The recommended install path is `git clone && npm install &&
+npm start` — pair it with the [Claude Code / Hermes / OpenClaw / Cursor
+HTTP-transport config block](#claude-desktop) shown above.
+
+Why not `npx -y getpatter-mcp` like other MCP servers?
+
+1. **HTTP transport, not stdio.** patter-mcp uses
+   [`mcp-use/server`](https://github.com/mcp-use/mcp-use) over HTTP, so
+   clients connect by URL. They never need to `npx`-launch the server
+   as a subprocess. The `npx -y` install path is required only for
+   stdio servers.
+
+2. **Native dependencies are slow.** `better-sqlite3` (compiled via
+   `node-gyp`) and `cloudflared` (postinstall binary download) push
+   the cold-start of `npx -y` into the 30s+ range — a poor first
+   impression for an MCP server. `git clone && npm install` does the
+   same work once, up-front, with no surprise.
+
+3. **Supply-chain blast radius.** Recent npm supply-chain attacks
+   (Shai-Hulud, Sep 2025; mini-Shai-Hulud, May 2026) explicitly
+   targeted MCP-adjacent packages. GitHub-only distribution keeps the
+   trust boundary on the repo + Cloudflare/Twilio carrier
+   credentials, not on a freshly-downloaded npm tarball.
+
+The package is structurally ready for npm publish (has `bin` entry,
+shebang, and `files` array) — if the broader Patter community asks
+for `npx -y` later, we can flip it on without a refactor.
+
 ## Contributing
 
 Pull requests are welcome. Please open an issue before submitting large changes.

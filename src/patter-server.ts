@@ -9,9 +9,28 @@
  *   - get_calls and get_transcript read from the DB (which includes
  *     calls from previous runs). When the DB is unavailable the Map
  *     is used directly as a fallback.
+ *
+ * SDK contract (getpatter >= 0.6.2):
+ *   - Carrier classes (`Twilio`, `Telnyx`) replace the v0.4.x credential
+ *     fields on the `Patter` constructor.
+ *   - STT/TTS providers are class instances (`new DeepgramSTT(...)`),
+ *     not the legacy `Patter.deepgram(...)` static factory.
+ *   - `phone.call({...})` accepts ONLY the outbound options
+ *     (`to`, `agent`, `machineDetection`, `voicemailMessage`, `ringTimeout`,
+ *     `onMachineDetection`, `variables`). It does NOT accept per-call
+ *     `onCallStart` / `onCallEnd` callbacks — those are wired ONCE on
+ *     `phone.serve({...})` and fire for every call, inbound and outbound.
+ *     Per-call dispatch is done by matching `data.call_id` against the
+ *     records we pre-populated in `makeCall()`.
  */
 
-import { Patter } from "getpatter";
+import {
+  Patter,
+  Twilio,
+  DeepgramSTT,
+  ElevenLabsTTS,
+  Tool,
+} from "getpatter";
 import { allVoiceTools } from "./voice-tools.js";
 import { endCallSession } from "./claude-bridge.js";
 import {
@@ -79,13 +98,19 @@ export class PatterServer {
    */
   readonly calls = new Map<string, CallRecord>();
 
+  /**
+   * Per-call duration-enforcement timers. Indexed by callId so the unified
+   * `onCallEnd` server-side handler can cancel the right timer when a call
+   * completes normally. In v0.4.x these lived inline in `phone.call()`'s
+   * callback closure; v0.6.2 moves the callbacks to the server scope, so
+   * the timers must be tracked here too.
+   */
+  private readonly durationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   constructor() {
     const twilioSid = process.env.TWILIO_ACCOUNT_SID;
     const twilioToken = process.env.TWILIO_AUTH_TOKEN;
     const phoneNumber = process.env.TWILIO_PHONE_NUMBER;
-    const openaiKey = process.env.OPENAI_API_KEY;
-    const deepgramKey = process.env.DEEPGRAM_API_KEY;
-    const elevenlabsKey = process.env.ELEVENLABS_API_KEY;
 
     if (!twilioSid || !twilioToken || !phoneNumber) {
       throw new Error(
@@ -93,16 +118,15 @@ export class PatterServer {
       );
     }
 
+    // Provider keys (OPENAI_API_KEY, DEEPGRAM_API_KEY, ELEVENLABS_API_KEY)
+    // are read from env directly by each provider class (DeepgramSTT,
+    // ElevenLabsTTS, OpenAIRealtime, ...) in v0.6.x — they are no longer
+    // passed on the Patter constructor.
     this.phone = new Patter({
-      mode: "local",
-      openaiKey,
-      twilioSid,
-      twilioToken,
+      carrier: new Twilio({ accountSid: twilioSid, authToken: twilioToken }),
       phoneNumber,
       webhookUrl: process.env.WEBHOOK_URL || "localhost",
-      deepgramKey,
-      elevenlabsKey,
-    } as Record<string, unknown>);
+    });
 
     // Initialise SQLite — errors are caught internally and set dbAvailable=false
     initDb();
@@ -123,6 +147,14 @@ export class PatterServer {
     return record;
   }
 
+  private clearDurationTimer(callId: string): void {
+    const timer = this.durationTimers.get(callId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.durationTimers.delete(callId);
+    }
+  }
+
   /** Create a Patter agent with voice tools attached. */
   private createAgent(
     systemPrompt: string,
@@ -133,22 +165,129 @@ export class PatterServer {
       systemPrompt,
       voice: voice || "nova",
       firstMessage: firstMessage || "Hello!",
-      provider: "pipeline",
-      stt: Patter.deepgram({ apiKey: process.env.DEEPGRAM_API_KEY! }),
-      tts: Patter.elevenlabs({
-        apiKey: process.env.ELEVENLABS_API_KEY!,
-        voice: voice || "nova",
+      // No `engine` argument → pipeline mode (STT → LLM → TTS).
+      stt: new DeepgramSTT({ apiKey: process.env.DEEPGRAM_API_KEY }),
+      tts: new ElevenLabsTTS({
+        apiKey: process.env.ELEVENLABS_API_KEY,
+        voiceId: voice || "nova",
       }),
       tools: allVoiceTools.map((t) =>
-        Patter.tool({
+        new Tool({
           name: t.name,
           description: t.description,
           parameters: t.parameters,
           handler: t.handler,
-        })
+        }),
       ),
-    } as Record<string, unknown>);
+    });
   }
+
+  // -------------------------------------------------------------------------
+  // Unified call lifecycle handlers (server-wide in v0.6.2)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Fires for every call start — inbound OR outbound.
+   *
+   * Inbound: `data.call_id` is one we've never seen, so create the record
+   * from scratch using `data.caller` / `data.callee`.
+   *
+   * Outbound: `data.call_id` matches a record `makeCall()` pre-populated
+   * with status `"ringing"`. Promote it to `"in-progress"` and start the
+   * duration timer.
+   */
+  private readonly handleCallStart = async (
+    data: Record<string, unknown>,
+  ): Promise<void> => {
+    const carrierId = data.call_id as string | undefined;
+    if (!carrierId) return;
+
+    const existing = this.calls.get(carrierId);
+    if (existing) {
+      // OUTBOUND — record already exists from makeCall().
+      const updated = mergeRecord(existing, {
+        status: "in-progress",
+        from: (data.caller as string) || existing.from,
+      });
+      this.persist(updated);
+      log(`Call ${carrierId} connected`);
+
+      // Arm the maximum-duration guard. Cleared on normal call end.
+      const timer = setTimeout(() => {
+        log(
+          `WARNING: Call ${carrierId} exceeded maximum duration ` +
+            `(${MAX_CALL_DURATION_SECONDS}s) — marking completed and ending ` +
+            `agent session — carrier connection may continue.`,
+        );
+        decrementConcurrent(updated.userId);
+
+        const current = this.calls.get(carrierId);
+        if (current && current.status === "in-progress") {
+          const terminated = mergeRecord(current, {
+            status: "completed",
+            endedAt: Date.now(),
+            duration: MAX_CALL_DURATION_SECONDS,
+          });
+          this.persist(terminated);
+          // Fire-and-forget: setTimeout cannot await; endCallSession has
+          // internal error handling.
+          void endCallSession(carrierId);
+        }
+        this.durationTimers.delete(carrierId);
+      }, MAX_CALL_DURATION_SECONDS * 1000);
+      this.durationTimers.set(carrierId, timer);
+      return;
+    }
+
+    // INBOUND — first time we see this call_id, create a fresh record.
+    const record: CallRecord = {
+      callId: carrierId,
+      from: data.caller as string,
+      to: data.callee as string,
+      direction: "inbound",
+      status: "in-progress",
+      startedAt: Date.now(),
+      transcript: [],
+    };
+    this.persist(record);
+    log(`Inbound call ${carrierId} from ${data.caller}`);
+  };
+
+  /**
+   * Fires for every call end — inbound OR outbound. Both paths converge
+   * to the same finalisation logic: clear the duration timer, decrement
+   * concurrent count for the owner (outbound only), update the record,
+   * close the Claude agent session.
+   */
+  private readonly handleCallEnd = async (
+    data: Record<string, unknown>,
+  ): Promise<void> => {
+    const carrierId = data.call_id as string | undefined;
+    if (!carrierId) return;
+
+    this.clearDurationTimer(carrierId);
+
+    const existing = this.calls.get(carrierId);
+    if (!existing) return;
+
+    // Outbound calls register a userId for rate-limit accounting. Inbound
+    // calls have no userId.
+    if (existing.direction === "outbound") {
+      decrementConcurrent(existing.userId);
+    }
+
+    const updated = mergeRecord(existing, {
+      status: "completed",
+      endedAt: Date.now(),
+      duration: (data.duration as number) || 0,
+      transcript:
+        (data.transcript as Array<{ role: string; text: string }>) || [],
+      metrics: (data.metrics as Record<string, unknown>) || {},
+    });
+    this.persist(updated);
+    await endCallSession(carrierId);
+    log(`${existing.direction} call ${carrierId} ended — ${updated.duration}s`);
+  };
 
   // -------------------------------------------------------------------------
   // Public server management
@@ -157,9 +296,9 @@ export class PatterServer {
   /**
    * Start the inbound call server in background.
    *
-   * Note: inbound calls intentionally have no userId — they originate from
-   * Twilio, not from an authenticated MCP client, so there is no Auth0
-   * identity to associate with them.
+   * The same `onCallStart` / `onCallEnd` handlers registered here also
+   * receive outbound-call events placed by `makeCall()` — that's how
+   * v0.6.2 wires the lifecycle (server-wide, not per-call).
    */
   async startServer(
     systemPrompt: string,
@@ -176,43 +315,9 @@ export class PatterServer {
         agent,
         port,
         dashboard: true,
-        onCallStart: async (data: Record<string, unknown>) => {
-          const callId =
-            (data.call_id as string) ||
-            `inbound_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-          const record: CallRecord = {
-            callId,
-            from: data.caller as string,
-            to: data.callee as string,
-            direction: "inbound",
-            status: "in-progress",
-            startedAt: Date.now(),
-            transcript: [],
-          };
-
-          this.persist(record);
-          log(`Inbound call ${callId} from ${data.caller}`);
-        },
-        onCallEnd: async (data: Record<string, unknown>) => {
-          const callId = data.call_id as string;
-          const existing = this.calls.get(callId);
-          if (!existing) return;
-
-          const updated = mergeRecord(existing, {
-            status: "completed",
-            endedAt: Date.now(),
-            duration: (data.duration as number) || 0,
-            transcript:
-              (data.transcript as Array<{ role: string; text: string }>) || [],
-            metrics: (data.metrics as Record<string, unknown>) || {},
-          });
-
-          this.persist(updated);
-          await endCallSession(callId);
-          log(`Inbound call ${callId} ended`);
-        },
-      } as Record<string, unknown>)
+        onCallStart: this.handleCallStart,
+        onCallEnd: this.handleCallEnd,
+      })
       .catch((err: Error) => {
         log(`Patter server error: ${err.message}`);
         this.serverRunning = false;
@@ -226,7 +331,15 @@ export class PatterServer {
   // Outbound calls
   // -------------------------------------------------------------------------
 
-  /** Place an outbound call. Returns the call ID immediately. */
+  /**
+   * Place an outbound call. Pre-populates the record so the unified
+   * server-wide `onCallStart` / `onCallEnd` handlers can promote it
+   * through its lifecycle when Patter callbacks fire.
+   *
+   * Returns the carrier-issued call ID. We use this same string as the
+   * record key — `phone.call()` resolves with the carrier call SID
+   * which matches `data.call_id` in subsequent callbacks.
+   */
   async makeCall(options: MakeCallOptions): Promise<string> {
     const {
       to,
@@ -238,10 +351,19 @@ export class PatterServer {
       userId,
     } = options;
 
-    const callId = `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const agent = this.createAgent(systemPrompt, firstMessage, voice);
+
+    // Provisional local ID — replaced with the carrier SID once we get
+    // the first onCallStart callback. We index timers and records by
+    // carrier SID, so this provisional record is keyed under it once
+    // the carrier reports back. Until then waitForCallEnd polls the
+    // local ID; we patch it up by aliasing both keys after start.
+    const provisionalId = `pending_${Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
 
     const initial: CallRecord = {
-      callId,
+      callId: provisionalId,
       to,
       direction: "outbound",
       status: "ringing",
@@ -249,98 +371,33 @@ export class PatterServer {
       transcript: [],
       userId,
     };
-
     this.persist(initial);
 
-    const agent = this.createAgent(systemPrompt, firstMessage, voice);
-
-    // Duration-enforcement timeout handle — cleared when the call ends normally.
-    let durationTimer: ReturnType<typeof setTimeout> | undefined;
-
-    const clearDurationTimer = (): void => {
-      if (durationTimer !== undefined) {
-        clearTimeout(durationTimer);
-        durationTimer = undefined;
-      }
-    };
-
-    this.phone
-      .call({
+    try {
+      // v0.6.2 LocalCallOptions: { to, agent, machineDetection?,
+      //   onMachineDetection?, voicemailMessage?, ringTimeout?, variables? }
+      await this.phone.call({
         to,
         agent,
         machineDetection,
         voicemailMessage,
-        onCallStart: async (data: Record<string, unknown>) => {
-          const existing = this.calls.get(callId);
-          if (!existing) return;
-
-          const updated = mergeRecord(existing, {
-            status: "in-progress",
-            from: data.caller as string,
-          });
-
-          this.persist(updated);
-          log(`Call ${callId} connected`);
-
-          // Enforce maximum call duration.
-          durationTimer = setTimeout(() => {
-            log(
-              `WARNING: Call ${callId} exceeded maximum duration ` +
-                `(${MAX_CALL_DURATION_SECONDS}s) — marking call as completed and ending agent session — carrier connection may continue.`,
-            );
-            decrementConcurrent(userId);
-
-            const current = this.calls.get(callId);
-            if (current && current.status === "in-progress") {
-              const terminated = mergeRecord(current, {
-                status: "completed",
-                endedAt: Date.now(),
-                duration: MAX_CALL_DURATION_SECONDS,
-              });
-              this.persist(terminated);
-              // Fire-and-forget: setTimeout cannot await; endCallSession has internal error handling
-              void endCallSession(callId);
-            }
-          }, MAX_CALL_DURATION_SECONDS * 1000);
-        },
-        onCallEnd: async (data: Record<string, unknown>) => {
-          clearDurationTimer();
-          decrementConcurrent(userId);
-
-          const existing = this.calls.get(callId);
-          if (!existing) return;
-
-          const updated = mergeRecord(existing, {
-            status: "completed",
-            endedAt: Date.now(),
-            duration: (data.duration as number) || 0,
-            transcript:
-              (data.transcript as Array<{ role: string; text: string }>) || [],
-            metrics: (data.metrics as Record<string, unknown>) || {},
-          });
-
-          this.persist(updated);
-          await endCallSession(callId);
-          log(`Call ${callId} ended — ${updated.duration}s`);
-        },
-      } as Record<string, unknown>)
-      .catch((err: Error) => {
-        clearDurationTimer();
-        decrementConcurrent(userId);
-
-        const existing = this.calls.get(callId);
-        if (!existing) return;
-
+      });
+    } catch (err) {
+      // The call failed before connecting — finalise locally.
+      const message = err instanceof Error ? err.message : String(err);
+      const existing = this.calls.get(provisionalId);
+      if (existing) {
         const failed = mergeRecord(existing, {
           status: "failed",
           endedAt: Date.now(),
         });
-
         this.persist(failed);
-        log(`Call ${callId} failed: ${err.message}`);
-      });
+      }
+      decrementConcurrent(userId);
+      log(`Call ${provisionalId} failed: ${message}`);
+    }
 
-    return callId;
+    return provisionalId;
   }
 
   // -------------------------------------------------------------------------

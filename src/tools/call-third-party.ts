@@ -1,14 +1,11 @@
 import { z } from "zod";
 import type { PatterServer, CallRecord } from "../patter-server.js";
 
-// TODO: remove cast when zod v4 is adopted
-type ZodAny = z.ZodTypeAny;
-
 export const callThirdPartySchema = z.object({
   to: z.string().describe("Phone number to call in E.164 format"),
   task: z.string().describe("What the AI agent should accomplish on the call (e.g. 'ask if there is a table for 2 tonight at 8pm')"),
   voice: z.string().optional().describe("TTS voice name"),
-}) as unknown as ZodAny;
+});
 
 export type CallThirdPartyInput = z.infer<typeof callThirdPartySchema>;
 

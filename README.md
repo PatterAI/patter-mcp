@@ -172,6 +172,66 @@ cp .env.example .env
 # Edit .env with your API keys
 ```
 
+### Lifecycle modes
+
+The embedded Patter server (HTTP + cloudflared tunnel) is expensive to boot. By default it starts **lazily** on the first tool call, so MCP sessions that never place a call pay zero startup cost. Four modes are supported:
+
+| Mode | Trigger | When to use |
+|---|---|---|
+| **Lazy** (default) | No env var set | Local dev, Claude Code sessions where calls are occasional |
+| **Eager** | `PATTER_EAGER=1` | CI smoke tests, demos where the first call must be instant |
+| **Stable tunnel** | `PATTER_TUNNEL_HOSTNAME=patter.example.com` | Long-running deployments — named cloudflared tunnel, stable webhook URL across restarts |
+| **Production webhook** | `WEBHOOK_URL=https://your.api/webhook` | Hosted deployments behind your own ingress, no tunnel |
+
+#### Lazy (default)
+
+```bash
+npm start
+# MCP server up immediately; Patter HTTP/tunnel boots on first make_call.
+```
+
+The first `make_call` (or any other tool) triggers a one-time boot. Concurrent tool calls during boot coalesce on a single in-flight promise — no double-boot. If boot fails (e.g. tunnel handshake error), the next tool call retries cleanly.
+
+#### Eager
+
+```bash
+PATTER_EAGER=1 npm start
+```
+
+Boots the Patter server during MCP startup. Same behaviour as `patter-mcp` ≤ 0.2.x. Use when you need the first call to be instant or you want startup errors to surface immediately (rather than at first tool call).
+
+#### Stable tunnel (named cloudflared)
+
+```bash
+PATTER_TUNNEL_HOSTNAME=patter.your-domain.com npm start
+```
+
+Patter uses a **named** cloudflared tunnel with a stable hostname instead of the default quick tunnel (which generates a fresh `*.trycloudflare.com` URL on every restart). Required when you've configured a Twilio/Telnyx webhook to point at a fixed URL.
+
+Prerequisites: a cloudflared tunnel created with `cloudflared tunnel create patter` and the corresponding DNS CNAME pointing to `<tunnel-id>.cfargotunnel.com`.
+
+#### Production webhook (no tunnel)
+
+```bash
+WEBHOOK_URL=https://your-domain.com/webhook npm start
+```
+
+Skip cloudflared entirely. Use when the MCP server is deployed behind your own ingress (nginx, Caddy, k8s ingress, Fly.io, Railway, etc.) and the carrier webhook can reach it directly. The Patter SDK will not attempt to start a tunnel — it just listens on `PATTER_PORT` and trusts the URL you provided.
+
+#### Health check
+
+`/health` exposes the current lifecycle state:
+
+```json
+{
+  "status": "ok",
+  "mode": "mcp",
+  "phone": "+15551234567",
+  "serverRunning": false,   // ← true after first tool call (lazy mode)
+  "activeSessions": 1
+}
+```
+
 ### Claude Desktop
 
 Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
@@ -194,6 +254,37 @@ npm run dev          # Run with tsx (auto-restart)
 npm run build        # Build for production
 npm start            # Run built version
 ```
+
+## Distribution
+
+`patter-mcp` is distributed as a **GitHub repository**, not an npm
+package. The recommended install path is `git clone && npm install &&
+npm start` — pair it with the [Claude Code / Hermes / OpenClaw / Cursor
+HTTP-transport config block](#claude-desktop) shown above.
+
+Why not `npx -y getpatter-mcp` like other MCP servers?
+
+1. **HTTP transport, not stdio.** patter-mcp uses
+   [`mcp-use/server`](https://github.com/mcp-use/mcp-use) over HTTP, so
+   clients connect by URL. They never need to `npx`-launch the server
+   as a subprocess. The `npx -y` install path is required only for
+   stdio servers.
+
+2. **Native dependencies are slow.** `better-sqlite3` (compiled via
+   `node-gyp`) and `cloudflared` (postinstall binary download) push
+   the cold-start of `npx -y` into the 30s+ range — a poor first
+   impression for an MCP server. `git clone && npm install` does the
+   same work once, up-front, with no surprise.
+
+3. **Supply-chain blast radius.** Recent npm supply-chain attacks
+   (Shai-Hulud, Sep 2025; mini-Shai-Hulud, May 2026) explicitly
+   targeted MCP-adjacent packages. GitHub-only distribution keeps the
+   trust boundary on the repo + Cloudflare/Twilio carrier
+   credentials, not on a freshly-downloaded npm tarball.
+
+The package is structurally ready for npm publish (has `bin` entry,
+shebang, and `files` array) — if the broader Patter community asks
+for `npx -y` later, we can flip it on without a refactor.
 
 ## Contributing
 

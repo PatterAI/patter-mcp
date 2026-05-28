@@ -9,7 +9,7 @@
 
 import { MCPServer, oauthAuth0Provider } from "mcp-use/server";
 
-import { PatterServer } from "./patter-server.js";
+import { createPatter, getPatter, maybeEagerBoot } from "./patter-lifecycle.js";
 import { makeCallHandler, makeCallSchema, type MakeCallInput } from "./tools/make-call.js";
 import { callThirdPartyHandler, callThirdPartySchema, type CallThirdPartyInput } from "./tools/call-third-party.js";
 import { getCallsHandler } from "./tools/get-calls.js";
@@ -47,9 +47,9 @@ function extractUserId(ctx: { auth?: { user: { userId: string } } }): string | u
 // Shared Patter server instance
 // ---------------------------------------------------------------------------
 
-const patter: PatterServer = (() => {
+const patter = (() => {
   try {
-    return new PatterServer();
+    return createPatter();
   } catch (err) {
     log(`Failed to initialize Patter: ${err instanceof Error ? err.message : String(err)}`);
     log("Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OPENAI_API_KEY");
@@ -105,6 +105,7 @@ server.tool(
 
     // Replace raw input with the validated E.164 number
     const validatedArgs: MakeCallInput = { ...args, to: phoneResult.e164 };
+    await getPatter(); // lazy boot at first tool call
     return makeCallHandler(validatedArgs, patter, userId);
   },
 );
@@ -136,6 +137,7 @@ server.tool(
 
     // Replace raw input with the validated E.164 number
     const validatedArgs: CallThirdPartyInput = { ...args, to: phoneResult.e164 };
+    await getPatter(); // lazy boot at first tool call
     return callThirdPartyHandler(validatedArgs, patter, userId);
   },
 );
@@ -148,6 +150,7 @@ server.tool(
   },
   async (_args, ctx) => {
     const userId = extractUserId(ctx);
+    await getPatter(); // lazy boot at first tool call
     return getCallsHandler(patter, userId);
   },
 );
@@ -161,6 +164,7 @@ server.tool(
   },
   async (args: GetTranscriptInput, ctx) => {
     const userId = extractUserId(ctx);
+    await getPatter(); // lazy boot at first tool call
     return getTranscriptHandler(args, patter, userId);
   },
 );
@@ -191,18 +195,7 @@ server.app.get("/health", (c) =>
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  // Start Patter inbound server in background
-  const defaultPrompt =
-    "You are a helpful AI assistant accessible by phone. " +
-    "You can read files, run commands, and search code when asked. " +
-    "Be concise and clear — this is a phone conversation.";
-
-  await patter.startServer(
-    process.env.AGENT_SYSTEM_PROMPT ?? defaultPrompt,
-    process.env.AGENT_FIRST_MESSAGE ?? "Hello! I'm your AI assistant. How can I help?",
-    process.env.AGENT_VOICE ?? "nova",
-    PATTER_PORT,
-  );
+  await maybeEagerBoot();
 
   // Start MCP HTTP server (inspector auto-available at /inspector)
   await server.listen(MCP_PORT);
@@ -231,6 +224,7 @@ Patter MCP Server
   log(`Widget: call-dashboard-widget (MCP Apps / ChatGPT)`);
   log(`Voice tools (during calls): read_file, run_command, search_code`);
   log(`Auth: ${oauthConfig ? `Auth0 (${process.env.AUTH0_DOMAIN})` : "disabled (no AUTH0_DOMAIN)"}`);
+  log(`Lifecycle: ${process.env.PATTER_EAGER === "1" ? "eager" : "lazy (boot on first tool call)"}`);
 }
 
 main().catch((err) => {

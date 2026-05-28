@@ -172,6 +172,66 @@ cp .env.example .env
 # Edit .env with your API keys
 ```
 
+### Lifecycle modes
+
+The embedded Patter server (HTTP + cloudflared tunnel) is expensive to boot. By default it starts **lazily** on the first tool call, so MCP sessions that never place a call pay zero startup cost. Four modes are supported:
+
+| Mode | Trigger | When to use |
+|---|---|---|
+| **Lazy** (default) | No env var set | Local dev, Claude Code sessions where calls are occasional |
+| **Eager** | `PATTER_EAGER=1` | CI smoke tests, demos where the first call must be instant |
+| **Stable tunnel** | `PATTER_TUNNEL_HOSTNAME=patter.example.com` | Long-running deployments — named cloudflared tunnel, stable webhook URL across restarts |
+| **Production webhook** | `WEBHOOK_URL=https://your.api/webhook` | Hosted deployments behind your own ingress, no tunnel |
+
+#### Lazy (default)
+
+```bash
+npm start
+# MCP server up immediately; Patter HTTP/tunnel boots on first make_call.
+```
+
+The first `make_call` (or any other tool) triggers a one-time boot. Concurrent tool calls during boot coalesce on a single in-flight promise — no double-boot. If boot fails (e.g. tunnel handshake error), the next tool call retries cleanly.
+
+#### Eager
+
+```bash
+PATTER_EAGER=1 npm start
+```
+
+Boots the Patter server during MCP startup. Same behaviour as `patter-mcp` ≤ 0.2.x. Use when you need the first call to be instant or you want startup errors to surface immediately (rather than at first tool call).
+
+#### Stable tunnel (named cloudflared)
+
+```bash
+PATTER_TUNNEL_HOSTNAME=patter.your-domain.com npm start
+```
+
+Patter uses a **named** cloudflared tunnel with a stable hostname instead of the default quick tunnel (which generates a fresh `*.trycloudflare.com` URL on every restart). Required when you've configured a Twilio/Telnyx webhook to point at a fixed URL.
+
+Prerequisites: a cloudflared tunnel created with `cloudflared tunnel create patter` and the corresponding DNS CNAME pointing to `<tunnel-id>.cfargotunnel.com`.
+
+#### Production webhook (no tunnel)
+
+```bash
+WEBHOOK_URL=https://your-domain.com/webhook npm start
+```
+
+Skip cloudflared entirely. Use when the MCP server is deployed behind your own ingress (nginx, Caddy, k8s ingress, Fly.io, Railway, etc.) and the carrier webhook can reach it directly. The Patter SDK will not attempt to start a tunnel — it just listens on `PATTER_PORT` and trusts the URL you provided.
+
+#### Health check
+
+`/health` exposes the current lifecycle state:
+
+```json
+{
+  "status": "ok",
+  "mode": "mcp",
+  "phone": "+15551234567",
+  "serverRunning": false,   // ← true after first tool call (lazy mode)
+  "activeSessions": 1
+}
+```
+
 ### Claude Desktop
 
 Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:

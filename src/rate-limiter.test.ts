@@ -109,11 +109,18 @@ describe("checkRateLimit — DB-backed checks", () => {
     expect(result.reason).toContain("Daily call limit");
   });
 
-  it("blocks when DB concurrent count equals the limit", () => {
-    mockCountConcurrent.mockReturnValue(2);
-    const result = checkRateLimit("db-user-3");
+  it("blocks when the in-memory concurrent count equals the limit (DB mode)", () => {
+    // Concurrent accounting is in-memory in both modes: the wait:true model
+    // leaves no in-progress DB row, so the live-call count is tracked via
+    // incrementConcurrent / decrementConcurrent, not countConcurrentCallsByUser.
+    const userId = "db-user-3-" + Date.now();
+    incrementConcurrent(userId);
+    incrementConcurrent(userId);
+    const result = checkRateLimit(userId);
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain("Too many active calls");
+    decrementConcurrent(userId);
+    decrementConcurrent(userId);
   });
 
   it("blocks when hourly budget cap is exceeded", () => {
@@ -199,11 +206,15 @@ describe("rate limit error messages", () => {
 
   it("concurrent limit message mentions waiting for a call to finish", () => {
     mockCountDaily.mockReturnValue(0);
-    mockCountConcurrent.mockReturnValue(2);
-    const result = checkRateLimit("user-msg-concurrent");
+    const userId = "user-msg-concurrent-" + Date.now();
+    incrementConcurrent(userId);
+    incrementConcurrent(userId);
+    const result = checkRateLimit(userId);
     expect(result.allowed).toBe(false);
     if (!result.allowed) {
       expect(result.reason).toContain("wait");
     }
+    decrementConcurrent(userId);
+    decrementConcurrent(userId);
   });
 });

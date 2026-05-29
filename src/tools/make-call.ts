@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { PatterServer, MakeCallOptions } from "../patter-server.js";
+import type { PatterServer, MakeCallOptions, CallRecord } from "../patter-server.js";
 
 export const makeCallSchema = z.object({
   to: z.string().describe("Phone number to call in E.164 format (e.g. +15551234567)"),
@@ -11,6 +11,11 @@ export const makeCallSchema = z.object({
 });
 
 export type MakeCallInput = z.infer<typeof makeCallSchema>;
+
+function formatTranscript(transcript: Array<{ role: string; text: string }>): string {
+  if (!transcript.length) return "(no transcript)";
+  return transcript.map((t) => `[${t.role}] ${t.text}`).join("\n");
+}
 
 export async function makeCallHandler(
   args: MakeCallInput,
@@ -27,19 +32,22 @@ export async function makeCallHandler(
       voicemailMessage: args.voicemailMessage,
       userId,
     };
-    const callId = await patter.makeCall(callOptions);
+    // makeCall blocks until the call reaches a terminal state (the SDK's
+    // call({ wait: true }) primitive) and returns the mapped CallRecord.
+    const record: CallRecord = await patter.makeCall(callOptions);
 
     return {
       content: [
         {
           type: "text" as const,
           text:
-            `Call initiated to ${args.to}.\n\n` +
-            `Call ID: ${callId}\n` +
-            `Status: ringing\n\n` +
-            `The AI agent will speak using the system prompt you provided.\n` +
-            `During the call, the agent can read files, run commands, and search code.\n\n` +
-            `Use get_calls to check status. Use get_transcript when the call completes.`,
+            `Call to ${args.to} ${record.status === "completed" ? "completed" : "ended"}.\n\n` +
+            `Call ID: ${record.callId}\n` +
+            `Outcome: ${record.outcome ?? "unknown"}\n` +
+            `Status: ${record.status}\n` +
+            `Duration: ${record.duration ?? 0}s\n\n` +
+            `Transcript:\n${formatTranscript(record.transcript)}\n\n` +
+            `Use get_transcript with Call ID ${record.callId} for the full record.`,
         },
       ],
     };

@@ -12,7 +12,7 @@
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/typescript-5.0%2B-3178c6?logo=typescript&logoColor=white" alt="TypeScript 5+" />
   <img src="https://img.shields.io/badge/MCP-Streamable%20HTTP-black?logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMCIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyIi8+PC9zdmc+" alt="MCP" /></a>
-  <a href="https://github.com/PatterAI/Patter"><img src="https://img.shields.io/badge/Patter%20SDK-0.4.0-orange" alt="Patter SDK" /></a>
+  <a href="https://github.com/PatterAI/Patter"><img src="https://img.shields.io/badge/Patter%20SDK-0.6.3-orange" alt="Patter SDK" /></a>
 </p>
 
 <p align="center">
@@ -69,10 +69,15 @@ Ask Claude:
 
 | Tool | Description |
 |---|---|
-| `make_call` | Place an outbound call with an AI voice agent |
-| `call_third_party` | Call a third party with an autonomous task (e.g. restaurant reservation) |
+| `make_call` | Place an outbound call with an AI voice agent; waits for the call to end and returns the outcome + transcript |
+| `call_third_party` | Call a third party with an autonomous task (e.g. restaurant reservation); waits and returns the transcript |
 | `get_calls` | List all calls with status, duration, and cost |
 | `get_transcript` | Get the full conversation transcript of a call |
+
+Both `make_call` and `call_third_party` are **completion-aware**: they block until
+the call reaches a terminal state and return a structured outcome
+(`answered` / `voicemail` / `no_answer` / `busy` / `failed`), duration, transcript,
+and cost — see [How It Works](#how-it-works).
 
 ### Claude Code Integration (used by the AI agent during calls)
 
@@ -118,6 +123,38 @@ During a phone call, the voice agent has access to a full Claude Code session vi
 </td>
 </tr>
 </table>
+
+### SDK contract (getpatter ≥ 0.6.3)
+
+patter-mcp leans on one SDK primitive for every outbound call:
+
+```ts
+const result = await phone.call({ to, agent, machineDetection, voicemailMessage, wait: true });
+// result: { callId, outcome, status, durationSeconds, transcript, cost, metrics }
+```
+
+- **Outbound (`make_call`, `call_third_party`).** `call({ wait: true })` blocks
+  until the call hangs up (timeout-bounded by the SDK) and resolves with a
+  `CallResult`. Every field comes from a real carrier signal: `outcome` is the
+  carrier-agnostic projection (`answered` / `voicemail` from answering-machine
+  detection + media-stream end; `no_answer` / `busy` / `failed` straight from the
+  carrier status callback). patter-mcp maps that result directly into a
+  `CallRecord` — there is no provisional id and no polling.
+
+  > Before 0.4.0 the outbound path stitched the carrier call together by hand
+  > with a `pending_<ts>` provisional id that never matched the real carrier
+  > SID, so the lifecycle callbacks never correlated and `call_third_party`
+  > polled a record that stayed `ringing` until it timed out. It is now
+  > functional end-to-end.
+
+- **Inbound.** Inbound calls have no initiator to await, so the server-wide
+  `onCallStart` / `onCallEnd` callbacks wired on `phone.serve(...)` create and
+  finalise their records. Those callbacks fire for every call but filter on
+  `direction` and ignore outbound events (which `makeCall` owns).
+
+- **Teardown.** On `SIGTERM` / `SIGINT` the server calls `phone.disconnect()` —
+  closing the cloudflared tunnel, the WebSocket server, and any pending
+  `call({ wait: true })` awaiters — so nothing is left running on exit.
 
 ### Example: Claude Code calls the user
 

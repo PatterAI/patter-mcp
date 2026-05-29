@@ -20,6 +20,7 @@ interface CallRow {
   from_number: string | null;
   direction: "outbound" | "inbound";
   status: "ringing" | "in-progress" | "completed" | "failed";
+  outcome: string | null;
   started_at: number;
   ended_at: number | null;
   duration: number | null;
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS calls (
   from_number TEXT,
   direction  TEXT NOT NULL CHECK(direction IN ('outbound', 'inbound')),
   status     TEXT NOT NULL CHECK(status IN ('ringing', 'in-progress', 'completed', 'failed')),
+  outcome    TEXT,
   started_at INTEGER NOT NULL,
   ended_at   INTEGER,
   duration   INTEGER,
@@ -49,6 +51,15 @@ CREATE TABLE IF NOT EXISTS calls (
 CREATE INDEX IF NOT EXISTS idx_calls_user_id ON calls(user_id);
 CREATE INDEX IF NOT EXISTS idx_calls_status  ON calls(status);
 `.trim();
+
+/**
+ * Idempotent migration for databases created before the `outcome` column
+ * existed. `ALTER TABLE ... ADD COLUMN` throws "duplicate column name" when
+ * the column is already present, so the caller swallows that specific error.
+ */
+const MIGRATIONS: ReadonlyArray<string> = [
+  "ALTER TABLE calls ADD COLUMN outcome TEXT",
+];
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -80,6 +91,7 @@ function rowToRecord(row: CallRow): CallRecord {
     from: row.from_number ?? undefined,
     direction: row.direction,
     status: row.status,
+    outcome: (row.outcome as CallRecord["outcome"]) ?? undefined,
     startedAt: row.started_at,
     endedAt: row.ended_at ?? undefined,
     duration: row.duration ?? undefined,
@@ -102,6 +114,7 @@ function recordToRow(r: CallRecord): CallRow {
     from_number: r.from ?? null,
     direction: r.direction,
     status: r.status,
+    outcome: r.outcome ?? null,
     started_at: r.startedAt,
     ended_at: r.endedAt ?? null,
     duration: r.duration ?? null,
@@ -154,11 +167,11 @@ function prepareStatements(database: Database): Statements {
     upsert: database.prepare(`
       INSERT INTO calls (
         call_id, user_id, to_number, from_number,
-        direction, status, started_at, ended_at,
+        direction, status, outcome, started_at, ended_at,
         duration, transcript, metrics
       ) VALUES (
         @call_id, @user_id, @to_number, @from_number,
-        @direction, @status, @started_at, @ended_at,
+        @direction, @status, @outcome, @started_at, @ended_at,
         @duration, @transcript, @metrics
       )
       ON CONFLICT(call_id) DO UPDATE SET
@@ -167,6 +180,7 @@ function prepareStatements(database: Database): Statements {
         from_number  = excluded.from_number,
         direction    = excluded.direction,
         status       = excluded.status,
+        outcome      = excluded.outcome,
         started_at   = excluded.started_at,
         ended_at     = excluded.ended_at,
         duration     = excluded.duration,
@@ -213,6 +227,25 @@ function prepareStatements(database: Database): Statements {
 }
 
 /**
+ * Apply additive schema migrations to an existing database. Each statement
+ * is an `ALTER TABLE ... ADD COLUMN`; the "duplicate column name" error is
+ * swallowed so the migration is idempotent across restarts and fresh DBs
+ * (where the column already came from CREATE TABLE).
+ */
+function runMigrations(database: Database): void {
+  for (const statement of MIGRATIONS) {
+    try {
+      database.exec(statement);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.includes("duplicate column name")) {
+        throw err;
+      }
+    }
+  }
+}
+
+/**
  * Initialise the SQLite connection and create tables.
  * Safe to call multiple times — subsequent calls are no-ops.
  *
@@ -229,6 +262,7 @@ export function initDb(): void {
     const BetterSqlite3 = require("better-sqlite3") as typeof import("better-sqlite3");
     db = new BetterSqlite3(DB_PATH);
     db.exec(CREATE_TABLE);
+    runMigrations(db);
     stmts = prepareStatements(db);
     _dbAvailable = true;
     log(`SQLite ready at ${DB_PATH}`);

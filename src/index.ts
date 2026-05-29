@@ -9,7 +9,7 @@
 
 import { MCPServer, oauthAuth0Provider } from "mcp-use/server";
 
-import { createPatter, getPatter, maybeEagerBoot } from "./patter-lifecycle.js";
+import { createPatter, getPatter, maybeEagerBoot, isPatterBooting } from "./patter-lifecycle.js";
 import { makeCallHandler, makeCallSchema, type MakeCallInput } from "./tools/make-call.js";
 import { callThirdPartyHandler, callThirdPartySchema, type CallThirdPartyInput } from "./tools/call-third-party.js";
 import { getCallsHandler } from "./tools/get-calls.js";
@@ -74,7 +74,7 @@ const oauthConfig =
 
 const server = new MCPServer({
   name: "patter-mcp",
-  version: "0.2.0",
+  version: "0.4.0",
   ...(oauthConfig !== undefined ? { oauth: oauthConfig } : {}),
 });
 
@@ -85,7 +85,9 @@ server.tool(
     description:
       "Place an outbound phone call with an AI voice agent. The agent speaks " +
       "using the system prompt and can read files, run commands, and search " +
-      "code during the call. Returns immediately with a call ID.",
+      "code during the call. Blocks until the call ends, then returns the " +
+      "outcome (answered / voicemail / no_answer / busy / failed), duration, " +
+      "and full transcript.",
     schema: makeCallSchema,
   },
   async (args: MakeCallInput, ctx) => {
@@ -226,6 +228,41 @@ Patter MCP Server
   log(`Auth: ${oauthConfig ? `Auth0 (${process.env.AUTH0_DOMAIN})` : "disabled (no AUTH0_DOMAIN)"}`);
   log(`Lifecycle: ${process.env.PATTER_EAGER === "1" ? "eager" : "lazy (boot on first tool call)"}`);
 }
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+
+let shuttingDown = false;
+
+/**
+ * Tear the embedded Patter server down on process termination.
+ *
+ * Only acts when the server was actually booted (lazy mode boots on the first
+ * tool call), using the same memoized instance via getPatter(). disconnect()
+ * stops the HTTP server, closes the cloudflared tunnel, drops any pending
+ * `call({ wait: true })` awaiters, and clears prewarm/TTS work — without it
+ * the tunnel and WebSocket server are abandoned on exit.
+ */
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`Received ${signal} — shutting down...`);
+  try {
+    if (isPatterBooting()) {
+      const p = await getPatter();
+      await p.disconnect();
+      log("Patter server disconnected cleanly");
+    }
+  } catch (err) {
+    log(`Error during shutdown: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
 
 main().catch((err) => {
   log(`Fatal: ${err}`);

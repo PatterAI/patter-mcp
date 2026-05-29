@@ -13,7 +13,6 @@
 import {
   isDbAvailable,
   countDailyCallsByUser,
-  countConcurrentCallsByUser,
   sumHourlyCostUsd,
 } from "./db.js";
 
@@ -78,13 +77,18 @@ function utcHourStartMs(): number {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory fallback counters (used when DB is unavailable)
+// In-memory counters
 // ---------------------------------------------------------------------------
 
-// NOTE: If the DB becomes unavailable *after* calls have already been started
-// in DB mode, the in-memory concurrent counter will be inaccurate because
-// those ongoing calls were never tracked here. The in-memory fallback is only
-// reliable when it has been the active tracking mechanism from the start.
+// The daily counter is an in-memory FALLBACK used only when the DB is
+// unavailable (the DB is authoritative for the daily count otherwise).
+//
+// The concurrent counter, by contrast, is ALWAYS authoritative — it is the
+// single source of truth for "calls live right now" in both DB and in-memory
+// modes. Under the wait:true model a call is live exactly for the duration of
+// PatterServer.makeCall (which increments on entry and decrements in finally),
+// leaving no in-progress DB row to count, so this ephemeral per-process
+// counter is the right home for that state.
 
 const memoryDailyCount: Map<string, { date: string; count: number }> =
   new Map();
@@ -152,17 +156,18 @@ export function checkRateLimit(userId: string | undefined): RateLimitResult {
 }
 
 /**
- * Record a newly-started call for rate-limit tracking purposes.
+ * Record a newly-started call for daily rate-limit tracking.
  *
- * When the DB is available this is a no-op (the call row is already written
- * by PatterServer.persist). Only updates in-memory counters, which are used
- * as fallback when the DB is unavailable.
+ * When the DB is available this is a no-op (the daily count is read from the
+ * persisted call rows). When the DB is unavailable it primes the in-memory
+ * daily fallback counter. Concurrent accounting is NOT done here — it is
+ * owned by PatterServer.makeCall (increment on entry / decrement in finally),
+ * the only window in which a call is actually live under the wait:true model.
  */
 export function recordCallStart(userId: string | undefined): void {
   if (!userId) return;
   if (!isDbAvailable()) {
     memoryIncrementDaily(userId);
-    incrementConcurrent(userId);
   }
 }
 
@@ -181,7 +186,10 @@ function checkRateLimitDb(userId: string): RateLimitResult {
     };
   }
 
-  const concurrentCount = countConcurrentCallsByUser(userId);
+  // Concurrent count is always read from the in-memory counter, which is the
+  // authoritative live-call tracker in both modes (see the counter section
+  // above). The DB has no in-progress row to count under the wait:true model.
+  const concurrentCount = memoryGetConcurrent(userId);
   if (concurrentCount >= MAX_CONCURRENT_CALLS) {
     return {
       allowed: false,
@@ -235,9 +243,13 @@ function checkRateLimitMemory(userId: string): RateLimitResult {
 }
 
 // ---------------------------------------------------------------------------
-// Re-export config for use elsewhere (e.g. duration enforcement)
+// Max call duration (informational)
 // ---------------------------------------------------------------------------
 
+// Parsed/validated config kept for operators who set MAX_CALL_DURATION_SECONDS.
+// The hard duration ceiling is now enforced by the SDK: `call({ wait: true })`
+// is timeout-bounded and the embedded server arms its own per-call max-duration
+// guard, so patter-mcp no longer runs a duration timer of its own.
 export const MAX_CALL_DURATION_SECONDS = parsePositiveInt(
   process.env.MAX_CALL_DURATION_SECONDS,
   300,

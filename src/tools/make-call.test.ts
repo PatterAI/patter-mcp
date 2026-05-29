@@ -1,20 +1,41 @@
 import { describe, it, expect, vi } from "vitest";
 import { makeCallHandler } from "./make-call.js";
-import type { PatterServer } from "../patter-server.js";
+import type { PatterServer, CallRecord } from "../patter-server.js";
 
 // ---------------------------------------------------------------------------
 // Minimal mock PatterServer
 // ---------------------------------------------------------------------------
 
-function makeMockPatter(makeCallImpl: () => Promise<string>): PatterServer {
+function makeCompletedRecord(overrides: Partial<CallRecord> = {}): CallRecord {
+  return {
+    callId: "call_abc_123",
+    to: "+15551234567",
+    direction: "outbound",
+    status: "completed",
+    outcome: "answered",
+    startedAt: Date.now() - 30_000,
+    endedAt: Date.now(),
+    duration: 30,
+    transcript: [
+      { role: "assistant", text: "Hi there, how can I help?" },
+      { role: "user", text: "Just testing." },
+    ],
+    metrics: { cost: { total: 0.02 } },
+    ...overrides,
+  };
+}
+
+function makeMockPatter(
+  makeCallImpl: () => Promise<CallRecord>,
+): PatterServer {
   return {
     makeCall: vi.fn(makeCallImpl),
     getCallsForUser: vi.fn(() => new Map()),
     getCallForUser: vi.fn(),
     callThirdParty: vi.fn(),
-    waitForCallEnd: vi.fn(),
     startServer: vi.fn(),
     simulateCallEnd: vi.fn(),
+    disconnect: vi.fn(),
     calls: new Map(),
     phoneNumber: "+15550000000",
     isServerRunning: false,
@@ -26,9 +47,9 @@ function makeMockPatter(makeCallImpl: () => Promise<string>): PatterServer {
 // ---------------------------------------------------------------------------
 
 describe("makeCallHandler", () => {
-  it("returns success content with callId when patter.makeCall resolves", async () => {
+  it("returns success content with the completed call details", async () => {
     // Arrange
-    const patter = makeMockPatter(() => Promise.resolve("call_abc_123"));
+    const patter = makeMockPatter(() => Promise.resolve(makeCompletedRecord()));
 
     // Act
     const result = await makeCallHandler(
@@ -41,11 +62,42 @@ describe("makeCallHandler", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("call_abc_123");
     expect(result.content[0].text).toContain("+15551234567");
-    expect(result.content[0].text).toContain("ringing");
+    expect(result.content[0].text).toContain("completed");
+  });
+
+  it("surfaces the carrier outcome and the transcript", async () => {
+    const patter = makeMockPatter(() =>
+      Promise.resolve(makeCompletedRecord({ outcome: "voicemail" })),
+    );
+
+    const result = await makeCallHandler(
+      { to: "+15551234567", systemPrompt: "Leave a message" },
+      patter,
+    );
+
+    const text = result.content[0].text;
+    expect(text).toContain("Outcome: voicemail");
+    expect(text).toContain("[assistant] Hi there, how can I help?");
+    expect(text).toContain("[user] Just testing.");
+  });
+
+  it("includes the duration in the success message", async () => {
+    const patter = makeMockPatter(() =>
+      Promise.resolve(makeCompletedRecord({ duration: 42 })),
+    );
+
+    const result = await makeCallHandler(
+      { to: "+15551234567", systemPrompt: "Help" },
+      patter,
+    );
+
+    expect(result.content[0].text).toContain("Duration: 42s");
   });
 
   it("passes all options to patter.makeCall", async () => {
-    const patter = makeMockPatter(() => Promise.resolve("call_options"));
+    const patter = makeMockPatter(() =>
+      Promise.resolve(makeCompletedRecord({ callId: "call_options" })),
+    );
 
     await makeCallHandler(
       {
@@ -71,16 +123,18 @@ describe("makeCallHandler", () => {
     });
   });
 
-  it("includes get_calls and get_transcript hints in the success message", async () => {
-    const patter = makeMockPatter(() => Promise.resolve("call_hints_test"));
+  it("includes a get_transcript hint in the success message", async () => {
+    const patter = makeMockPatter(() =>
+      Promise.resolve(makeCompletedRecord({ callId: "call_hints_test" })),
+    );
 
     const result = await makeCallHandler(
       { to: "+15551112222", systemPrompt: "Help" },
       patter,
     );
 
-    expect(result.content[0].text).toContain("get_calls");
     expect(result.content[0].text).toContain("get_transcript");
+    expect(result.content[0].text).toContain("call_hints_test");
   });
 
   it("returns an error result when patter.makeCall throws", async () => {
@@ -113,7 +167,9 @@ describe("makeCallHandler", () => {
   });
 
   it("works without a userId (unauthenticated mode)", async () => {
-    const patter = makeMockPatter(() => Promise.resolve("call_no_auth"));
+    const patter = makeMockPatter(() =>
+      Promise.resolve(makeCompletedRecord({ callId: "call_no_auth" })),
+    );
 
     const result = await makeCallHandler(
       { to: "+15550001111", systemPrompt: "Hello" },

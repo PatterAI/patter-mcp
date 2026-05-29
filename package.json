@@ -1,6 +1,6 @@
 {
   "name": "getpatter-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server for Patter Voice AI — give Claude (and any MCP client) the ability to make and receive phone calls",
   "type": "module",
   "main": "dist/index.js",
@@ -25,7 +25,7 @@
     "better-sqlite3": "^12.9.0",
     "cloudflared": "^0.7.1",
     "e2b": "^2.19.0",
-    "getpatter": "^0.6.2",
+    "getpatter": "^0.6.3",
     "libphonenumber-js": "^1.12.41",
     "mcp-use": "^1.24.0",
     "zod": "^4.0.0"
